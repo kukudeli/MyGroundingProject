@@ -1,0 +1,32 @@
+# dataset
+data/
+drone/
+quad/
+waymo/
+splits/
+
+# logs
+log/
+logs/
+*.log
+
+# outputs
+checkpoints/
+outputs/
+experiments/
+
+# cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# system / editor
+.vscode/
+.DS_Store
+
+# build
+build/
+dist/
+*.so
+*.o
