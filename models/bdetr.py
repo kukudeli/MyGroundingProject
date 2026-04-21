@@ -89,12 +89,24 @@ class BeaUTyDETR(nn.Module):
             self.class_embeddings = nn.Linear(768, d_model - 128)
             self.box_embeddings = PositionEmbeddingLearned(6, 128)
 
-        # Cross-encoder
+        # Cross-modality encoding
         self.pos_embed = PositionEmbeddingLearned(3, d_model)
-        bi_layer = BiEncoderLayer(
-            d_model, dropout=0.1, activation="relu", n_heads=8, dim_feedforward=256, self_attend_lang=self_attend, self_attend_vis=self_attend, use_butd_enc_attn=butd
+        self.fine_proj = nn.Linear(d_model, d_model)
+        self.mid_proj = nn.Linear(d_model, d_model)
+        self.fine_cross_attn = nn.MultiheadAttention(d_model, num_heads=8, dropout=0.1, batch_first=True)
+        self.mid_cross_attn = nn.MultiheadAttention(d_model, num_heads=8, dropout=0.1, batch_first=True)
+        self.coarse_mlp = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
         )
-        self.cross_encoder = BiEncoder(bi_layer, 3)
+        gate_hidden_dim = max(d_model // 4, 16)
+        self.granularity_gate = nn.Sequential(
+            nn.Linear(2, gate_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(gate_hidden_dim, 3),
+        )
+        self.mid_topk = min(256, num_queries)
 
         # Query initialization
         self.points_obj_cls = PointsObjClsModule(d_model)
@@ -191,18 +203,70 @@ class BeaUTyDETR(nn.Module):
             detected_feats = None
 
         # Cross-modality encoding
-        points_features, text_feats = self.cross_encoder(
-            vis_feats=points_features.transpose(1, 2).contiguous(),
-            pos_feats=self.pos_embed(points_xyz).transpose(1, 2).contiguous(),
-            padding_mask=torch.zeros(len(points_xyz), points_xyz.size(1)).to(points_xyz.device).bool(),
-            text_feats=text_feats,
-            text_padding_mask=text_padding_mask,
-            end_points=end_points,
-            detected_feats=detected_feats,
-            detected_mask=detected_mask,
+        batch_size, feature_dim, num_points = points_features.shape
+        seq_len = text_feats.size(1)
+        points_obj_cls_logits = self.points_obj_cls(points_features)
+        end_points["seeds_obj_cls_logits"] = points_obj_cls_logits  # Shape: [B, 1, N]
+
+        visual_tokens = points_features.transpose(1, 2).contiguous()  # Shape: [B, N, C]
+        assert visual_tokens.shape == (batch_size, num_points, feature_dim)
+
+        # Fine-grained branch: point-wise visual tokens attend to projected attribute text tokens.
+        fine_text_tokens = self.fine_proj(text_feats)  # Shape: [B, L, C]
+        v_fine, _ = self.fine_cross_attn(
+            query=visual_tokens,
+            key=fine_text_tokens,
+            value=fine_text_tokens,
+            key_padding_mask=text_padding_mask,
+            need_weights=False,
         )
-        points_features = points_features.transpose(1, 2)
-        points_features = points_features.contiguous()  # (B, F, points)
+        v_fine = v_fine.contiguous()  # Shape: [B, N, C]
+
+        # Mid-grained branch: top-K objectness visual tokens attend to projected object/relation text tokens.
+        objectness_scores = points_obj_cls_logits.squeeze(1)  # Shape: [B, N]
+        topk = min(self.mid_topk, num_points)
+        topk_indices = torch.topk(objectness_scores, k=topk, dim=1)[1]  # Shape: [B, K]
+        gather_indices = topk_indices.unsqueeze(-1).expand(-1, -1, feature_dim)  # Shape: [B, K, C]
+        mid_visual_tokens = torch.gather(visual_tokens, dim=1, index=gather_indices)  # Shape: [B, K, C]
+        mid_text_tokens = self.mid_proj(text_feats)  # Shape: [B, L, C]
+        mid_aligned_tokens, _ = self.mid_cross_attn(
+            query=mid_visual_tokens,
+            key=mid_text_tokens,
+            value=mid_text_tokens,
+            key_padding_mask=text_padding_mask,
+            need_weights=False,
+        )
+        mid_aligned_tokens = mid_aligned_tokens.contiguous()  # Shape: [B, K, C]
+        v_mid = torch.zeros_like(visual_tokens)  # Shape: [B, N, C]
+        v_mid.scatter_(dim=1, index=gather_indices, src=mid_aligned_tokens)  # Shape: [B, N, C]
+
+        # Coarse-grained branch: global visual and CLS text semantics are fused and expanded to all points.
+        global_visual = visual_tokens.mean(dim=1)  # Shape: [B, C]
+        global_text = text_feats[:, 0, :].contiguous()  # Shape: [B, C]
+        coarse_input = torch.cat([global_visual, global_text], dim=-1)  # Shape: [B, 2C]
+        coarse_token = self.coarse_mlp(coarse_input)  # Shape: [B, C]
+        v_coarse = coarse_token.unsqueeze(1).expand(-1, num_points, -1).contiguous()  # Shape: [B, N, C]
+
+        assert v_fine.shape == visual_tokens.shape, f"v_fine shape {v_fine.shape} != {visual_tokens.shape}"
+        assert v_mid.shape == visual_tokens.shape, f"v_mid shape {v_mid.shape} != {visual_tokens.shape}"
+        assert v_coarse.shape == visual_tokens.shape, f"v_coarse shape {v_coarse.shape} != {visual_tokens.shape}"
+
+        # Dynamic gating: sample-level conditions produce fine/mid/coarse fusion weights.
+        mean_objectness = torch.sigmoid(objectness_scores).mean(dim=1, keepdim=True)  # Shape: [B, 1]
+        valid_text_lens = (~text_padding_mask).float().sum(dim=1, keepdim=True)  # Shape: [B, 1]
+        normalized_text_lens = valid_text_lens / max(seq_len, 1)  # Shape: [B, 1]
+        gate_condition = torch.cat([mean_objectness, normalized_text_lens], dim=-1)  # Shape: [B, 2]
+        gate_weights = F.softmax(self.granularity_gate(gate_condition), dim=-1)  # Shape: [B, 3]
+        end_points["multi_granularity_gate_weights"] = gate_weights
+        gate_weights = gate_weights.unsqueeze(1)  # Shape: [B, 1, 3]
+
+        v_fused = (
+            gate_weights[:, :, 0:1] * v_fine
+            + gate_weights[:, :, 1:2] * v_mid
+            + gate_weights[:, :, 2:3] * v_coarse
+        )
+        v_fused = v_fused.contiguous()  # Shape: [B, N, C]
+        points_features = v_fused.transpose(1, 2).contiguous()  # Shape: [B, C, N]
         end_points["text_memory"] = text_feats
         end_points["seed_features"] = points_features
         if self.contrastive_align_loss:
