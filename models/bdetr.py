@@ -258,6 +258,9 @@ class BeaUTyDETR(nn.Module):
             base_xyz = base_xyz.detach().clone()
             base_size = base_size.detach().clone()
 
+        end_points["proto_query_features"] = query
+        end_points["proto_features"] = query.mean(dim=1)
+
         return end_points
 
     def init_bn_momentum(self):

@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from .prototype_rebalance import PlatformPrototypeRebalanceLoss
 
 
 def is_dist_avail_and_initialized():
@@ -338,7 +339,26 @@ class SetCriterion(nn.Module):
         2) supervise each pair of matched ground-truth / prediction
     """
 
-    def __init__(self, matcher, losses={}, eos_coef=0.1, temperature=0.07):
+    def __init__(
+        self,
+        matcher,
+        losses={},
+        eos_coef=0.1,
+        temperature=0.07,
+        use_platform_proto=False,
+        proto_in_dim=288,
+        proto_dim=128,
+        num_platforms=3,
+        num_proto_classes=6,
+        proto_momentum=0.9,
+        proto_temperature=0.07,
+        proto_gap_threshold=0.05,
+        proto_pce_weight=0.1,
+        proto_per_weight=0.01,
+        proto_warmup_epoch=5,
+        proto_use_pce=True,
+        proto_use_per=True,
+    ):
         """
         Parameters:
             matcher: module that matches targets and proposals
@@ -351,6 +371,22 @@ class SetCriterion(nn.Module):
         self.eos_coef = eos_coef
         self.losses = losses
         self.temperature = temperature
+        self.use_platform_proto = use_platform_proto
+        if self.use_platform_proto:
+            self.platform_proto_loss = PlatformPrototypeRebalanceLoss(
+                in_dim=proto_in_dim,
+                proto_dim=proto_dim,
+                num_platforms=num_platforms,
+                num_classes=num_proto_classes,
+                momentum=proto_momentum,
+                temperature=proto_temperature,
+                gap_threshold=proto_gap_threshold,
+                pce_weight=proto_pce_weight,
+                per_weight=proto_per_weight,
+                warmup_epoch=proto_warmup_epoch,
+                use_pce=proto_use_pce,
+                use_per=proto_use_per,
+            )
 
     def loss_labels_st(self, outputs, targets, indices, num_boxes):
         """Soft token prediction (with objectness)."""
@@ -613,5 +649,30 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
     end_points['loss_giou'] = loss_giou
     end_points['query_points_generation_loss'] = query_points_generation_loss
     end_points['loss_constrastive_align'] = loss_contrastive_align
+    if set_criterion.use_platform_proto and set_criterion.training:
+        proto_features = end_points["proto_features"]
+        platform_labels = end_points["platform_label"].long()
+        class_labels = end_points["sem_cls_label"][:, 0].long()
+        valid_mask = end_points["box_label_mask"][:, 0].bool()
+        loss_proto, proto_stats = set_criterion.platform_proto_loss(
+            proto_features[valid_mask],
+            platform_labels[valid_mask],
+            class_labels[valid_mask],
+            epoch=end_points.get("epoch", None),
+        )
+        loss = loss + loss_proto
+        end_points["loss_proto"] = loss_proto
+        end_points["loss_pce"] = proto_stats["loss_pce"]
+        end_points["loss_per"] = proto_stats["loss_per"]
+        end_points["platform_gap"] = proto_stats["platform_gap"]
+        end_points["proto_active"] = proto_stats["proto_active"]
+        end_points["weak_platform"] = proto_stats["weak_platform"]
+        end_points["strong_platform"] = proto_stats["strong_platform"]
+    else:
+        zero = loss * 0.0
+        end_points["loss_proto"] = zero
+        end_points["loss_pce"] = zero
+        end_points["loss_per"] = zero
+        end_points["platform_gap"] = zero
     end_points['loss'] = loss
     return loss, end_points

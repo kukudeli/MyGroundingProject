@@ -36,6 +36,12 @@ CLASS_MAPPINGS = {
     "cyclist": 5,
 }
 
+PLATFORM_MAPPINGS = {
+    "waymo": 0,
+    "drone": 1,
+    "quad": 2,
+}
+
 # Waymo dataset synonyms
 WAYMO_SYNONYMS = {
     "car": ["car", "vehicle", "sedan", "van", "coupe", "automobile", "convertible", "hatchback", "SUV", 
@@ -719,6 +725,7 @@ class Joint3DDataset(Dataset):
 
         # Return
         _labels = np.zeros(MAX_NUM_OBJ)  # 132
+        _labels[0] = anno["target_id"]
 
         ret_dict = {
             "box_label_mask": box_label_mask.astype(np.float32),  # NOTE Used in loss calculation
@@ -731,6 +738,7 @@ class Joint3DDataset(Dataset):
             "utterances": (" ".join(anno["utterance"].replace(",", " ,").split()) + " . not mentioned"),
             "positive_map": positive_map.astype(np.float32),
             "point_instance_label": point_instance_label.astype(np.int64),  # NOTE Used in loss calculation
+            "platform_label": np.array(PLATFORM_MAPPINGS[anno["dataset"]], dtype=np.int64),
             "is_view_dep": self._is_view_dep(anno["utterance"]),
             "is_hard": False,
             "is_unique": False,
@@ -748,7 +756,9 @@ class Joint3DDataset(Dataset):
         positive_map = np.zeros((MAX_NUM_OBJ, 256))  #  1, 256
         positive_map_ = np.array(anno["pred_pos_map"]).reshape(-1, 256)
         positive_map[: len(positive_map_)] = positive_map_
-        _labels = np.zeros(MAX_NUM_OBJ)  # 132
+        _labels = np.zeros(MAX_NUM_OBJ, dtype=np.int64)  # 132
+        class_ids = anno["boxes_info"]["class_id"]
+        _labels[: len(class_ids)] = np.asarray(class_ids, dtype=np.int64)
         ret_dict = {
             "box_label_mask": box_label_mask.astype(np.float32),
             "center_label": gt_bboxes[:, :3].astype(np.float32),
@@ -762,6 +772,7 @@ class Joint3DDataset(Dataset):
             "utterances": (" ".join(anno["utterance"].replace(",", " ,").split()) + " . not mentioned"),
             "positive_map": positive_map.astype(np.float32),
             "point_instance_label": point_instance_label.astype(np.int64),
+            "platform_label": np.array(PLATFORM_MAPPINGS["waymo"], dtype=np.int64),
             "is_view_dep": self._is_view_dep(anno["utterance"]),
             "is_hard": False,
             "is_unique": False,

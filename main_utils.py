@@ -51,6 +51,18 @@ def parse_option():
     parser.add_argument("--use_soft_token_loss", action="store_true")
     parser.add_argument("--detect_intermediate", action="store_true")
     parser.add_argument("--joint_det", action="store_true")
+    parser.add_argument("--use_platform_proto", action="store_true")
+    parser.add_argument("--proto_dim", type=int, default=128)
+    parser.add_argument("--proto_momentum", type=float, default=0.9)
+    parser.add_argument("--proto_temperature", type=float, default=0.07)
+    parser.add_argument("--proto_gap_threshold", type=float, default=0.05)
+    parser.add_argument("--proto_pce_weight", type=float, default=0.1)
+    parser.add_argument("--proto_per_weight", type=float, default=0.01)
+    parser.add_argument("--proto_warmup_epoch", type=int, default=5)
+    parser.add_argument("--proto_use_pce", action="store_true")
+    parser.add_argument("--proto_use_per", action="store_true")
+    parser.add_argument("--num_platforms", type=int, default=3)
+    parser.add_argument("--num_proto_classes", type=int, default=6)
 
     # Data
     parser.add_argument("--batch_size", type=int, default=8, help="Batch Size during training")
@@ -148,7 +160,7 @@ def parse_option():
     return args
 
 
-def load_checkpoint(args, model, optimizer, scheduler):
+def load_checkpoint(args, model, optimizer, scheduler, set_criterion=None):
     """Load from checkpoint."""
     print("=> loading checkpoint '{}'".format(args.checkpoint_path))
 
@@ -158,9 +170,17 @@ def load_checkpoint(args, model, optimizer, scheduler):
     except Exception:
         args.start_epoch = 0
     model.load_state_dict(checkpoint["model"], strict=True)
+    if set_criterion is not None and "set_criterion" in checkpoint:
+        set_criterion.load_state_dict(checkpoint["set_criterion"], strict=False)
     if not args.eval and not args.reduce_lr:
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
+        optimizer_loaded = True
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        except ValueError as exc:
+            optimizer_loaded = False
+            print(f"=> skipped optimizer state due to parameter group mismatch: {exc}")
+        if optimizer_loaded:
+            scheduler.load_state_dict(checkpoint["scheduler"])
 
     print("=> loaded successfully '{}' (epoch {})".format(args.checkpoint_path, checkpoint["epoch"]))
 
@@ -183,10 +203,12 @@ def backup_python_files(self, backup_dirs, target_dir):
             shutil.copy2(item, target_dir)
 
 
-def save_checkpoint(args, epoch, model, optimizer, scheduler, save_cur=False):
+def save_checkpoint(args, epoch, model, optimizer, scheduler, save_cur=False, set_criterion=None):
     """Save checkpoint if requested."""
     if save_cur or epoch % args.save_freq == 0:
         state = {"config": args, "save_path": "", "model": model.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "epoch": epoch}
+        if set_criterion is not None:
+            state["set_criterion"] = set_criterion.state_dict()
         spath = os.path.join(args.log_dir, f"ckpt_epoch_{epoch}.pth")
         state["save_path"] = spath
         torch.save(state, spath)
@@ -333,19 +355,41 @@ class BaseTrainTester:
         losses = ["boxes", "labels"]
         if args.use_contrastive_align:
             losses.append("contrastive_align")
-        set_criterion = SetCriterion(matcher=matcher, losses=losses, eos_coef=0.1, temperature=0.07)
+        set_criterion = SetCriterion(
+            matcher=matcher,
+            losses=losses,
+            eos_coef=0.1,
+            temperature=0.07,
+            use_platform_proto=args.use_platform_proto,
+            proto_in_dim=288,
+            proto_dim=args.proto_dim,
+            num_platforms=args.num_platforms,
+            num_proto_classes=args.num_proto_classes,
+            proto_momentum=args.proto_momentum,
+            proto_temperature=args.proto_temperature,
+            proto_gap_threshold=args.proto_gap_threshold,
+            proto_pce_weight=args.proto_pce_weight,
+            proto_per_weight=args.proto_per_weight,
+            proto_warmup_epoch=args.proto_warmup_epoch,
+            proto_use_pce=args.proto_use_pce,
+            proto_use_per=args.proto_use_per,
+        )
         criterion = compute_hungarian_loss
 
         return criterion, set_criterion
 
     @staticmethod
-    def get_optimizer(args, model):
+    def get_optimizer(args, model, set_criterion=None):
         """Initialize optimizer."""
         param_dicts = [
             {"params": [p for n, p in model.named_parameters() if "backbone_net" not in n and "text_encoder" not in n and p.requires_grad]},
             {"params": [p for n, p in model.named_parameters() if "backbone_net" in n and p.requires_grad], "lr": args.lr_backbone},
             {"params": [p for n, p in model.named_parameters() if "text_encoder" in n and p.requires_grad], "lr": args.text_encoder_lr},
         ]
+        if set_criterion is not None:
+            criterion_params = [p for p in set_criterion.parameters() if p.requires_grad]
+            if len(criterion_params) > 0:
+                param_dicts.append({"params": criterion_params})
         optimizer = optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
         return optimizer
 
@@ -372,7 +416,7 @@ class BaseTrainTester:
         criterion, set_criterion = self.get_criterion(args)
 
         # Get optimizer
-        optimizer = self.get_optimizer(args, model)
+        optimizer = self.get_optimizer(args, model, set_criterion)
 
         # Get scheduler
         if train_loader is not None:
@@ -384,12 +428,13 @@ class BaseTrainTester:
         # Move model to devices
         if torch.cuda.is_available():
             model = model.cuda()
+            set_criterion = set_criterion.cuda()
         model = DistributedDataParallel(model, device_ids=[args.local_rank], broadcast_buffers=False)  # , find_unused_parameters=True
 
         # Check for a checkpoint
         if args.checkpoint_path:
             assert os.path.isfile(args.checkpoint_path)
-            load_checkpoint(args, model, optimizer, scheduler)
+            load_checkpoint(args, model, optimizer, scheduler, set_criterion)
             self.logger.info("Loaded checkpoint from '{}'".format(args.checkpoint_path))
 
         # Just eval and end execution
@@ -409,12 +454,12 @@ class BaseTrainTester:
             )
             if epoch % args.val_freq == 0:
                 if dist.get_rank() == 0:  # save model
-                    save_checkpoint(args, epoch, model, optimizer, scheduler)
+                    save_checkpoint(args, epoch, model, optimizer, scheduler, set_criterion=set_criterion)
                 print("Test evaluation.......")
                 self.evaluate_one_epoch(epoch, test_loader, model, criterion, set_criterion, args)
 
         # Training is over, evaluate
-        save_checkpoint(args, "last", model, optimizer, scheduler, True)
+        save_checkpoint(args, "last", model, optimizer, scheduler, True, set_criterion=set_criterion)
         saved_path = os.path.join(args.log_dir, "ckpt_epoch_last.pth")
         self.logger.info("Saved in {}".format(saved_path))
         self.evaluate_one_epoch(args.max_epoch, test_loader, model, criterion, set_criterion, args)
@@ -440,7 +485,7 @@ class BaseTrainTester:
     @staticmethod
     def _accumulate_stats(stat_dict, end_points):
         for key in end_points:
-            if "loss" in key or "acc" in key or "ratio" in key:
+            if "loss" in key or "acc" in key or "ratio" in key or key == "platform_gap":
                 if key not in stat_dict:
                     stat_dict[key] = 0
                 if isinstance(end_points[key], (float, int)):
@@ -459,6 +504,7 @@ class BaseTrainTester:
         """
         stat_dict = {}  # collect statistics
         model.train()  # set model to training mode
+        set_criterion.train()
 
         # Loop over batches
         for batch_idx, batch_data in tqdm(enumerate(train_loader), total=len(train_loader), desc="Train epoch {}".format(epoch)):
@@ -478,6 +524,7 @@ class BaseTrainTester:
             for key in batch_data:
                 assert key not in end_points
                 end_points[key] = batch_data[key]
+            end_points["epoch"] = epoch
             loss, end_points = self._compute_loss(end_points, criterion, set_criterion, args)
             optimizer.zero_grad()
             loss.backward()
@@ -493,7 +540,7 @@ class BaseTrainTester:
             if self.tb_writer:
                 global_step = epoch * len(train_loader) + batch_idx
                 for key in sorted(stat_dict.keys()):
-                    if "loss" in key and "proposal_" not in key and "last_" not in key and "head_" not in key:
+                    if ("loss" in key or key == "platform_gap") and "proposal_" not in key and "last_" not in key and "head_" not in key:
                         self.tb_writer.add_scalar(f"Train/{key}", stat_dict[key] / args.print_freq, global_step)
 
             if (batch_idx + 1) % args.print_freq == 0:
@@ -505,7 +552,7 @@ class BaseTrainTester:
                         [
                             f"{key} {stat_dict[key] / args.print_freq:.4f} \t"
                             for key in sorted(stat_dict.keys())
-                            if "loss" in key and "proposal_" not in key and "last_" not in key and "head_" not in key
+                            if ("loss" in key or key == "platform_gap") and "proposal_" not in key and "last_" not in key and "head_" not in key
                         ]
                     )
                 )
@@ -518,6 +565,7 @@ class BaseTrainTester:
     def _main_eval_branch(self, epoch, batch_idx, batch_data, test_loader, model, stat_dict, criterion, set_criterion, args):
         # Move to GPU
         batch_data = self._to_gpu(batch_data)
+        set_criterion.eval()
         inputs = self._get_inputs(batch_data)
         if "train" not in inputs:
             inputs.update({"train": False})
@@ -545,14 +593,14 @@ class BaseTrainTester:
                     [
                         f"{key} {stat_dict[key] / (float(batch_idx + 1)):.4f} \t"
                         for key in sorted(stat_dict.keys())
-                        if "loss" in key and "proposal_" not in key and "last_" not in key and "head_" not in key
+                        if ("loss" in key or key == "platform_gap") and "proposal_" not in key and "last_" not in key and "head_" not in key
                     ]
                 )
             )
 
         if self.tb_writer:
             for key in sorted(stat_dict.keys()):
-                if "loss" in key and "proposal_" not in key and "last_" not in key and "head_" not in key:
+                if ("loss" in key or key == "platform_gap") and "proposal_" not in key and "last_" not in key and "head_" not in key:
                     self.tb_writer.add_scalar(f"Eval/{key}", stat_dict[key] / (float(batch_idx + 1)), epoch * len(test_loader) + batch_idx)
 
         return stat_dict, end_points
