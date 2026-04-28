@@ -662,17 +662,23 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         )
         loss = loss + loss_proto
         end_points["loss_proto"] = loss_proto
-        end_points["loss_pce"] = proto_stats["loss_pce"]
-        end_points["loss_per"] = proto_stats["loss_per"]
-        end_points["platform_gap"] = proto_stats["platform_gap"]
-        end_points["proto_active"] = proto_stats["proto_active"]
-        end_points["weak_platform"] = proto_stats["weak_platform"]
-        end_points["strong_platform"] = proto_stats["strong_platform"]
+        for key, value in proto_stats.items():
+            end_points[key] = value
     else:
         zero = loss * 0.0
         end_points["loss_proto"] = zero
         end_points["loss_pce"] = zero
         end_points["loss_per"] = zero
         end_points["platform_gap"] = zero
+        end_points["proto_active"] = zero
+        end_points["pce_active"] = zero
+        end_points["per_active"] = zero
+        end_points["num_valid_samples"] = zero
+        end_points["num_active_platforms"] = zero
+        end_points["valid_platform_proto_count"] = zero
+        end_points["valid_global_proto_count"] = zero
+        end_points["fallback_proto_count"] = zero
+        end_points["weak_platform"] = zero
+        end_points["strong_platform"] = zero
     end_points['loss'] = loss
     return loss, end_points

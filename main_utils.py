@@ -220,6 +220,20 @@ def save_checkpoint(args, epoch, model, optimizer, scheduler, save_cur=False, se
 class BaseTrainTester:
     """Basic train/test class to be inherited."""
 
+    PROTO_STAT_KEYS = {
+        "platform_gap",
+        "proto_active",
+        "pce_active",
+        "per_active",
+        "num_valid_samples",
+        "num_active_platforms",
+        "valid_platform_proto_count",
+        "valid_global_proto_count",
+        "fallback_proto_count",
+        "weak_platform",
+        "strong_platform",
+    }
+
     def __init__(self, args):
         """Initialize."""
         name = args.log_dir.split("/")[-1]
@@ -485,7 +499,7 @@ class BaseTrainTester:
     @staticmethod
     def _accumulate_stats(stat_dict, end_points):
         for key in end_points:
-            if "loss" in key or "acc" in key or "ratio" in key or key == "platform_gap":
+            if "loss" in key or "acc" in key or "ratio" in key or key in BaseTrainTester.PROTO_STAT_KEYS:
                 if key not in stat_dict:
                     stat_dict[key] = 0
                 if isinstance(end_points[key], (float, int)):
@@ -540,7 +554,7 @@ class BaseTrainTester:
             if self.tb_writer:
                 global_step = epoch * len(train_loader) + batch_idx
                 for key in sorted(stat_dict.keys()):
-                    if ("loss" in key or key == "platform_gap") and "proposal_" not in key and "last_" not in key and "head_" not in key:
+                    if ("loss" in key or key in self.PROTO_STAT_KEYS) and "proposal_" not in key and "last_" not in key and "head_" not in key:
                         self.tb_writer.add_scalar(f"Train/{key}", stat_dict[key] / args.print_freq, global_step)
 
             if (batch_idx + 1) % args.print_freq == 0:
@@ -552,7 +566,7 @@ class BaseTrainTester:
                         [
                             f"{key} {stat_dict[key] / args.print_freq:.4f} \t"
                             for key in sorted(stat_dict.keys())
-                            if ("loss" in key or key == "platform_gap") and "proposal_" not in key and "last_" not in key and "head_" not in key
+                            if ("loss" in key or key in self.PROTO_STAT_KEYS) and "proposal_" not in key and "last_" not in key and "head_" not in key
                         ]
                     )
                 )
@@ -593,14 +607,14 @@ class BaseTrainTester:
                     [
                         f"{key} {stat_dict[key] / (float(batch_idx + 1)):.4f} \t"
                         for key in sorted(stat_dict.keys())
-                        if ("loss" in key or key == "platform_gap") and "proposal_" not in key and "last_" not in key and "head_" not in key
+                        if ("loss" in key or key in self.PROTO_STAT_KEYS) and "proposal_" not in key and "last_" not in key and "head_" not in key
                     ]
                 )
             )
 
         if self.tb_writer:
             for key in sorted(stat_dict.keys()):
-                if ("loss" in key or key == "platform_gap") and "proposal_" not in key and "last_" not in key and "head_" not in key:
+                if ("loss" in key or key in self.PROTO_STAT_KEYS) and "proposal_" not in key and "last_" not in key and "head_" not in key:
                     self.tb_writer.add_scalar(f"Eval/{key}", stat_dict[key] / (float(batch_idx + 1)), epoch * len(test_loader) + batch_idx)
 
         return stat_dict, end_points
