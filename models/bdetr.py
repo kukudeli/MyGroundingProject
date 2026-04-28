@@ -132,7 +132,7 @@ class BeaUTyDETR(nn.Module):
         end_points["seed_xyz"] = end_points["fp2_xyz"]
         end_points["seed_features"] = end_points["fp2_features"]
         # Text encoder
-        tokenized = self.tokenizer.batch_encode_plus(inputs["text"], padding="longest", return_tensors="pt").to(inputs["point_clouds"].device)
+        tokenized = self.tokenizer(inputs["text"], padding="max_length", max_length=256, truncation=True, return_tensors="pt").to(inputs["point_clouds"].device)
         encoded_text = self.text_encoder(**tokenized)
         text_feats = self.text_projector(encoded_text.last_hidden_state)
         # Invert attention mask that we get from huggingface

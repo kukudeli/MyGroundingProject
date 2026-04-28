@@ -279,7 +279,7 @@ class Joint3DDataset(Dataset):
                 self._log_error(f"match failed: {utterance}", class_names=class_names, dataset="waymo-multi")
                 continue
             # caption
-            tokenized = self.tokenizer.batch_encode_plus([self._format_caption(utterance)], padding="longest", return_tensors="pt")
+            tokenized = self.tokenizer([self._format_caption(utterance)], padding="max_length", max_length=256, truncation=True, return_tensors="pt")
             gt_map = get_positive_map(tokenized, all_positive)  # MARK positive map for multi-object
             anno_dict = {
                 "scan_id": frame_key,
@@ -375,7 +375,7 @@ class Joint3DDataset(Dataset):
                     # self._log_error(f"match failed: {utterance}", class_names=[cat_names], dataset=dataset)
                     continue
 
-                tokenized = self.tokenizer.batch_encode_plus([self._format_caption(utterance)], padding="longest", return_tensors="pt")
+                tokenized = self.tokenizer([self._format_caption(utterance)], padding="max_length", max_length=256, truncation=True, return_tensors="pt")
                 gt_map = get_positive_map(tokenized, [tokens_positive])
 
                 # ipdb.set_trace()
@@ -471,7 +471,7 @@ class Joint3DDataset(Dataset):
             tokens_positive[c][1] = end_span
 
         # Positive map (for soft token prediction)
-        tokenized = self.tokenizer.batch_encode_plus([self._format_caption(anno["utterance"])], padding="longest", return_tensors="pt")
+        tokenized = self.tokenizer([self._format_caption(anno["utterance"])], padding="max_length", max_length=256, truncation=True, return_tensors="pt")
         positive_map = np.zeros((MAX_NUM_OBJ, 256))
         gt_map = get_positive_map(tokenized, tokens_positive[: len(cat_names)])
         positive_map[: len(cat_names)] = gt_map

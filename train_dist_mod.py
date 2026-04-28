@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 
 from main_utils import parse_option, BaseTrainTester
-from data.model_util_scannet import ScannetDatasetConfig
+# from data.model_util_scannet import ScannetDatasetConfig  # disabled for 3EED smoke test
 from src.joint_det_dataset import Joint3DDataset
 from src.grounding_evaluator import GroundingEvaluator#, GroundingGTEvaluator
 from models import BeaUTyDETR
@@ -197,6 +197,7 @@ class TrainTester(BaseTrainTester):
 
         pdb.set_trace()
 
+        from data.model_util_scannet import ScannetDatasetConfig
         dataset_config = ScannetDatasetConfig(18)
         # Used for AP calculation
         CONFIG_DICT = {
