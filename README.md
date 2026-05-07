@@ -1,137 +1,69 @@
+# 面向多平台 3D Grounding 的平台条件原型重平衡方法
 
-<h1 align="center">3EED: Ground Everything Everywhere in 3D</h1>
+本仓库是基于 3EED baseline 的研究扩展项目，面向多平台户外 3D grounding 场景，探索 drone、quadruped、vehicle 等不同平台在联合训练中的学习不平衡问题。项目在原始 3EED / BeaUTyDETR 主干基础上，加入一个训练阶段可插拔的平台条件原型重平衡模块，用于动态识别强势平台与弱势平台，并通过 PCE 和 PER 调节平台间学习状态。
 
-<p align="center">
-    <a href="https://huggingface.co/datasets/RRRong/3EED/tree/main"><img src="https://img.shields.io/badge/Dataset-HuggingFace-ffcc00" /></a>
-    <a href="http://arxiv.org/abs/2511.01755"><img src="https://img.shields.io/badge/arXiv-Paper-b31b1b.svg" /></a>
-  <a href="https://project-3eed.github.io/"><img src="https://img.shields.io/badge/Project-Page-green.svg" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" /></a>
-  <img src="https://img.shields.io/badge/Python-3.10%7C3.11-blue" />
-  <img src="https://img.shields.io/badge/CUDA-11.1%20%7C%2012.4-informational" />
-  <img src="https://visitor-badge.laobi.icu/badge?page_id=iris0329.3eed" alt="Visitors"/>
-</p>
+需要说明：
 
-<p align="center" style="line-height: 1.3;">
-  <strong><a href="https://rongli.tech/">Rong Li</a></strong><sup>*</sup>,&nbsp;&nbsp;
-  <strong><a href="https://scholar.google.com/citations?hl=zh-CN&user=kMui170AAAAJ">Yuhao Dong</a></strong><sup>*</sup>,&nbsp;&nbsp;
-  <strong><a href="https://scholar.google.com/citations?hl=en&user=RJ7NR54AAAAJ">Tianshuai Hu</a></strong><sup>*</sup>,&nbsp;&nbsp;
-  <strong><a href="https://alanliangc.github.io/">Ao Liang</a></strong><sup>*</sup>,&nbsp;&nbsp;
-  <strong><a href="https://scholar.google.com/citations?user=J9a48hMAAAAJ&hl=en">Youquan Liu</a></strong><sup>*</sup>,&nbsp;&nbsp;
-  <strong><a href="https://dylanorange.github.io/">Dongyue Lu</a></strong><sup>*</sup><br>
-  <strong><a href="https://scholar.google.com/citations?user=lSDISOcAAAAJ">Liang Pan</a></strong>,&nbsp;&nbsp;
-  <strong><a href="https://ldkong.com/">Lingdong Kong</a></strong><sup>†</sup>,&nbsp;&nbsp;
-  <strong><a href="https://junweiliang.me/">Junwei Liang</a></strong><sup>‡</sup>,&nbsp;&nbsp;
-  <strong><a href="https://liuziwei7.github.io/">Ziwei Liu</a></strong><sup>‡</sup><br>
-</p>
-<p align="center" style="line-height: 0.9;">
-  <sup>*</sup>Equal contribution &nbsp;
-  <sup>†</sup>Project lead &nbsp; 
-  <sup>‡</sup>Corresponding authors
-</p>
+- 本仓库不是 3EED 官方仓库。
+- 本项目基于 3EED 数据集、baseline 代码和评估协议进行研究扩展。
+- 原始 3EED 的任务是根据 LiDAR 点云、RGB 图像和自然语言表达预测目标 3D 边界框。
+- 本项目目前重点关注 drone 与 quad 的联合训练，并保留 waymo 平台兼容性。
 
----
+## 1. 项目概述
 
-<p align="center">
-  <img src="figs/teaser.png" alt="3EED Teaser" width="90%">
-</p>
+任务输入：
 
+- LiDAR 点云
+- RGB 图像
+- 自然语言表达
+- 平台标签，例如 waymo / drone / quad
 
-## 🎯 Highlights
+任务输出：
 
-- **Cross-Platform**: First 3D grounding dataset spanning **vehicle**, **drone**, and **quadruped** platforms
-- **Large-Scale**: Large-scale annotated samples across diverse real-world scenarios
-- **Multi-Modal**: Synchronized **RGB**, **LiDAR**, and **language** annotations
-- **Challenging**: Complex outdoor environments with varying object densities and viewpoints
-- **Reproducible**: Unified evaluation protocols and baseline implementations
+- 语言所指目标的 3D bounding box
 
-### :books: Citation
+研究问题：
 
-If you find our work helpful, please consider citing:
+在多平台联合训练中，不同平台由于视角高度、点云稀疏程度、目标尺度、遮挡情况和场景覆盖范围不同，可能出现学习速度不一致。学习更快的平台可能主导共享表示空间，学习较慢的平台可能难以形成稳定类别特征。
 
-```bibtex
-@inproceedings{li2025_3eed,
-    title     = {{3EED}: Ground Everything Everywhere in {3D}},
-    author    = {Rong Li and Yuhao Dong and Tianshuai Hu and Ao Liang and Youquan Liu and Dongyue Lu and Liang Pan and Lingdong Kong and Junwei Liang and Ziwei Liu},
-    booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
-    volume    = {38},
-    year      = {2025}
-}
-```
+本项目方法：
 
+在 3EED baseline 的基础上增加 Platform-conditioned Prototype Rebalancing 模块。该模块：
 
+- 只在训练阶段启用；
+- 不改变原始 3D box 推理路径；
+- 维护平台条件类别原型；
+- 使用 EMA 动态估计平台学习状态；
+- 使用 PCE 增强弱势平台的类别聚类；
+- 使用 PER 抑制强势平台过早过度自信；
+- 支持 baseline / PCE / PER / PCE+PER 消融。
 
-## Statistics
+## 2. 当前代码特性
 
-<p align="center">
-  <img src="figs/statics.jpg" alt="3EED Dataset Statistics" width="90%">
-</p>
+- 保留 3EED / BeaUTyDETR 主干结构。
+- 在 `models/bdetr.py` 中额外导出 `proto_features` 作为原型模块输入。
+- 在 `models/prototype_rebalance.py` 中实现平台条件原型平衡模块。
+- 在 `models/losses.py` 中以可选方式追加 `loss_proto`。
+- 在 `main_utils.py` 中加入原型模块参数、日志和训练开关。
+- 在 `src/joint_det_dataset.py` 中使用平台标签支持平台级原型重平衡。
+- 支持通过命令行开关启用或关闭原型模块。
 
-> 📄 For detailed dataset statistics and analysis, please refer to our paper.
+## 3. 环境配置
 
+本项目沿用 3EED 的环境依赖。请优先使用与原始 3EED baseline 一致的 Python、PyTorch、CUDA 和自定义 CUDA 算子环境。
 
-## 📰 News
+| 组件 | 推荐版本 |
+|---|---|
+| Python | 3.10 或 3.11 |
+| PyTorch | 与 CUDA 匹配的版本 |
+| CUDA | 11.1 或 12.4 |
+| torchvision | 与 PyTorch 匹配 |
+| transformers | 支持 RoBERTa |
+| numpy / scipy / tqdm / tensorboard | 常规版本即可 |
 
-- **[2025.10]** Dataset and code are now publicly available on HuggingFace and GitHub! 📦 
-- **[2025.09]** 3EED has been accepted to **NeurIPS 2025 Dataset and Benchmark Track**! 🎉 
+如果服务器已经能运行原始 3EED baseline，则通常不需要额外配置大量依赖，只需要确认新增代码所需的 PyTorch、TensorBoard 等基础包可用。
 
-## 📚 Table of Contents
-
-- [Highlights](#-highlights)
-- [Statistics](#statistics)
-- [News](#-news)
-- [Table of Contents](#-table-of-contents)
-- [Installation](#️-installation)
-  - [Environment Setup](#environment-setup)
-  - [Custom CUDA Operators](#custom-cuda-operators)
-- [Pretrained Models](#-pretrained-models)
-  - [Language Encoder](#language-encoder)
-- [Dataset](#-dataset)
-  - [Download](#download)
-  - [Dataset Structure](#dataset-structure)
-- [Quick Start](#-quick-start)
-  - [Training](#training)
-  - [Evaluation](#evaluation)
-  - [Visualization](#visualization)
-  - [Baseline Checkpoints](#baseline-checkpoints)
-- [License](#-license)
-- [Acknowledgements](#-acknowledgements)
-  - [Codebase \& Methods](#codebase--methods)
-  - [Dataset Sources](#dataset-sources)
-
-
-## ⚙️ Installation
-
-### Environment Setup
-
-We support both CUDA 11 and CUDA 12 environments. Choose the one that matches your system:
-
-<details>
-<summary><b>Option 1: CUDA 11.1 Environment</b></summary>
-
-| Component   | Version         |
-|-------------|-----------------|
-| CUDA        | 11.1            |
-| cuDNN       | 8.0.5           |
-| PyTorch     | 1.9.1+cu111     |
-| torchvision | 0.10.1+cu111    |
-| Python      | 3.10 / 3.11     |
-
-</details>
-
-<details>
-<summary><b>Option 2: CUDA 12.4 Environment</b></summary>
-
-| Component   | Version         |
-|-------------|-----------------|
-| CUDA        | 12.4            |
-| cuDNN       | 8.0.5           |
-| PyTorch     | 2.5.1+cu124     |
-| torchvision | 0.20.1+cu124    |
-| Python      | 3.10 / 3.11     |
-
-</details>
-
-### Custom CUDA Operators
+### 3.1 编译自定义 CUDA 算子
 
 ```bash
 cd ops/teed_pointnet/pointnet2_batch
@@ -141,173 +73,197 @@ cd ../roiaware_pool3d
 python setup.py develop
 ```
 
-## 📦 Pretrained Models
+如果编译失败，优先检查 CUDA 版本、PyTorch 版本和 `CUDA_HOME` 是否正确。
 
-### Language Encoder
+### 3.2 RoBERTa 权重
 
-Download the [RoBERTa-base checkpoint](https://huggingface.co/FacebookAI/roberta-base/) from HuggingFace and move it to `data/roberta_base`.
+本项目使用 RoBERTa 作为文本编码器。请下载 RoBERTa-base 权重，并放置到：
 
-## 💾 Dataset
-
-### Download
-
-Download the 3EED dataset from HuggingFace:
-
-🔗 **Dataset Link**: https://huggingface.co/datasets/RRRong/3EED
-
-### Dataset Structure
-
-After extraction, organize your dataset as follows:
-
+```text
+data/roberta_base/
 ```
+
+代码中默认从以下路径加载：
+
+```text
+./data/roberta_base/
+```
+
+## 4. 数据准备
+
+本项目使用 3EED 数据集，数据组织方式沿用原始 3EED。
+
+```text
 data/3eed/
-├── drone/                    # Drone platform data
-│   ├── scene-0001/
-│   │   ├── 0000_0/
+├── drone/
+│   ├── scene-xxxx/
+│   │   ├── frame/
 │   │   │   ├── image.jpg
 │   │   │   ├── lidar.bin
 │   │   │   └── meta_info.json
-│   │   └── ...
-│   └── ...
-├── quad/                     # Quadruped platform data
-│   ├── scene-0001/
-│   └── ...
-├── waymo/                    # Vehicle platform data
-│   ├── scene-0001/
-│   └── ...
-├── roberta_base/            # Language model weights
-└── splits/                  # Train/val split files
-    ├── drone_train.txt
-    ├── drone_val.txt
-    ├── quad_train.txt
-    ├── quad_val.txt
-    ├── waymo_train.txt
-    └── waymo_val.txt
+├── quad/
+├── waymo/
+├── splits/
+│   ├── drone_train.txt
+│   ├── drone_val.txt
+│   ├── quad_train.txt
+│   ├── quad_val.txt
+│   ├── waymo_train.txt
+│   └── waymo_val.txt
+└── roberta_base/
 ```
 
-----
-
-## 🚀 Quick Start
-
-### Training
-
-Train the baseline model on different platform combinations:
-
+当前原型平衡实验主要使用：
 
 ```bash
-# Train on all platforms (recommended for best performance)
+--dataset drone quad
+--test_dataset drone quad
+```
+
+也可以使用原始 3EED 脚本训练单平台或全平台模型。
+
+## 5. 代码使用方式
+
+### 5.1 原始 3EED-style 训练
+
+```bash
+# 全平台训练
 bash scripts/train_3eed.sh
 
-# Train on single platform
-bash scripts/train_waymo.sh   # Vehicle only
-bash scripts/train_drone.sh   # Drone only
-bash scripts/train_quad.sh    # Quadruped only
+# 单平台训练
+bash scripts/train_waymo.sh
+bash scripts/train_drone.sh
+bash scripts/train_quad.sh
 ```
 
+这些脚本主要用于复现或对比原始 baseline 行为。
 
-**Output:**
-- Checkpoints: `logs/Train_<datasets>_Val_<datasets>/<timestamp>/`
-- Training logs: `logs/Train_<datasets>_Val_<datasets>/<timestamp>/log.txt`
-- TensorBoard logs: `logs/Train_<datasets>_Val_<datasets>/<timestamp>/tensorboard/`
+### 5.2 drone + quad 原型平衡实验
 
+`scripts/train_proto_drone_quad.sh` 是当前项目的主要实验入口。它支持四种模式：
 
-### Evaluation
-
-Evaluate trained models on validation sets:
-
-**Quick Evaluation:**
 ```bash
-# Evaluate on all platforms
+# 1. baseline：不启用原型平衡模块
+bash scripts/train_proto_drone_quad.sh baseline
+
+# 2. pce：只启用平台条件 Prototype Cross-Entropy
+bash scripts/train_proto_drone_quad.sh pce
+
+# 3. per：只启用 Prototype Entropy Regularization
+bash scripts/train_proto_drone_quad.sh per
+
+# 4. pce_per：启用完整原型平衡模块
+bash scripts/train_proto_drone_quad.sh pce_per
+```
+
+- `baseline`：原始 3EED-style drone + quad 联合训练，不启用原型平衡。
+- `pce`：启用平台条件原型交叉熵，主要验证原型聚类约束是否有效。
+- `per`：只启用强势平台熵正则，主要用于消融。
+- `pce_per`：启用完整平台原型重平衡模块。
+
+### 5.3 关键参数说明
+
+```text
+--use_platform_proto          启用平台原型平衡模块
+--proto_use_pce               启用 PCE
+--proto_use_per               启用 PER
+--proto_pce_weight            PCE 损失权重
+--proto_per_weight            PER 损失权重
+--proto_score_momentum        平台状态 EMA 动量
+--proto_gap_threshold         强弱平台差距阈值
+--proto_warmup_epoch          动态重平衡 warmup epoch
+--proto_min_platform_seen     平台参与强弱判断所需的最小累计样本数
+--proto_weak_pce_boost        弱势平台 PCE 权重增强系数
+--proto_max_pce_boost         弱势平台 PCE 最大增强上限
+```
+
+### 5.4 推荐 smoke test
+
+正式训练前建议先跑小规模测试，确认数据、平台标签、loss 和日志都正常。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch --nproc_per_node 1 --master_port 29501 \
+train_dist_mod.py \
+--num_decoder_layers 6 \
+--use_color \
+--data_root data/3eed \
+--split_dir data/3eed/splits \
+--dataset drone quad \
+--test_dataset drone quad \
+--batch_size 2 \
+--max_epoch 1 \
+--print_freq 1 \
+--save_freq 1 \
+--val_freq 1 \
+--detect_intermediate \
+--joint_det \
+--use_soft_token_loss \
+--use_contrastive_align \
+--self_attend \
+--debug \
+--use_platform_proto \
+--proto_use_pce \
+--proto_use_per \
+--flag smoke_pce_per
+```
+
+如果 smoke test 通过，再使用脚本进行正式训练。
+
+## 6. 评估
+
+```bash
+# 全平台评估
 bash scripts/val_3eed.sh
 
-# Evaluate on single platform
-bash scripts/val_waymo.sh    # Vehicle
-bash scripts/val_drone.sh    # Drone
-bash scripts/val_quad.sh     # Quadruped
+# 单平台评估
+bash scripts/val_waymo.sh
+bash scripts/val_drone.sh
+bash scripts/val_quad.sh
 ```
 
-**⚠️ Before running evaluation:**
-1. Update `--checkpoint_path` in the script to point to your trained model
-2. Ensure the validation dataset is downloaded and properly structured
+运行评估前需要在脚本中确认 `--checkpoint_path` 指向正确 checkpoint。
 
-**Output:**
-- Results saved to: `<checkpoint_dir>/evaluation/Val_<dataset>/<timestamp>/`
+对于原型平衡实验，建议不仅观察整体 Acc@25 / Acc@50，也要关注 drone 和 quad 的平台级性能差距。
 
-### Visualization
+## 7. 日志与诊断
 
-Visualize predictions with 3D bounding boxes overlaid on point clouds:
+训练时重点关注以下日志：
 
-```bash
-# Visualize prediction results
-python utils/visualize_pred.py
+```text
+loss_proto
+loss_pce
+loss_per
+platform_gap
+status_ready
+pce_rebalance_active
+weak_pce_weight
+weak_platform
+strong_platform
+platform_score_ema_0 / 1 / 2
+platform_seen_count_0 / 1 / 2
+platform_batch_score_0 / 1 / 2
 ```
 
-**Visualization Output:**
-- 🟢 **Ground Truth**: Green bounding box
-- 🔴 **Prediction**: Red bounding box
+平台编号：
 
-**Output Structure:**
-```
-visualizations/
-├── waymo/
-│   ├── scene-0001_frame-0000/
-│   │   ├── pointcloud.ply
-│   │   ├── pred/gt_bbox.ply
-│   │   └── info.txt
-│   └── ...
-├── drone/
-└── quad/
+```text
+0 = waymo
+1 = drone
+2 = quad
 ```
 
-### Baseline Checkpoints
+这些指标用于判断原型模块是否真的检测到平台学习差异，以及 PCE/PER 是否按预期激活。
 
-Baseline models and predictions are available at: [Huggingface](https://huggingface.co/datasets/RRRong/3EED/blob/main/baseline_ckpt_pred.zip)
+## 8. 当前状态
 
+当前项目仍处于研究开发阶段。已完成：
 
-## 📄 License
+- 可插拔平台原型平衡模块；
+- 平台条件原型库；
+- 全局原型与 fallback 原型；
+- EMA-based 平台状态估计；
+- 弱势平台加权 PCE；
+- 强势平台 PER；
+- baseline / PCE / PER / PCE+PER 运行入口。
 
-This repository is released under the **Apache 2.0 License** (see [LICENSE](LICENSE)).
-
-
-## 🙏 Acknowledgements
-
-We sincerely thank the following projects and teams that made this work possible:
-
-### Codebase & Methods
-- [**BUTD-DETR**](https://github.com/nickgkan/butd_detr) - Bottom-Up Top-Down DETR for visual grounding
-- [**WildRefer**](https://github.com/4DVLab/WildRefer) - Wild referring expression comprehension
-
-### Dataset Sources
-- [**Waymo Open Dataset**](https://waymo.com/open/) - Vehicle platform data
-- [**M3ED**](https://m3ed.io/) - Drone and quadruped platform data
-
-
-## Related Projects
-
-| :sunglasses: Awesome | Projects |
-|:-:|:-|
-| |
-| <img width="95px" src="https://github.com/ldkong1205/ldkong1205/blob/master/Images/worldbench_survey.webp"> | **3D and 4D World Modeling: A Survey**<br>[[GitHub Repo](https://github.com/worldbench/survey)] - [[Project Page](https://worldbench.github.io/survey)] - [[Paper](https://worldbench.github.io/assets_common/papers/survey.pdf)] |
-| <img width="95px" src="https://github.com/ldkong1205/ldkong1205/blob/master/Images/worldlens.png"> | **WorldLens: Full-Spectrum Evaluations of Driving World Models in Real World**<br>[[GitHub Repo](https://github.com/worldbench/WorldLens)] - [[Project Page](https://worldbench.github.io/worldlens)] - [[Paper](https://worldbench.github.io/assets_common/papers/worldlens.pdf)] |
-| <img width="95px" src="https://github.com/ldkong1205/ldkong1205/blob/master/Images/lidarcrafter.png"> | **LiDARCrafter: Dynamic 4D World Modeling from LiDAR Sequences**<br>[[GitHub Repo](https://github.com/lidarcrafter/toolkit)] - [[Project Page]](https://lidarcrafter.github.io/) - [[Paper](https://arxiv.org/abs/2508.03692)] |
-| <img width="95px" src="https://github.com/ldkong1205/ldkong1205/blob/master/Images/drivebench.png"> | **Are VLMs Ready for Autonomous Driving? A Study from Reliability, Data & Metric Perspectives**<br>[[GitHub Repo](https://github.com/drive-bench/toolkit)] - [[Project Page]](https://drive-bench.github.io/) - [[Paper](https://arxiv.org/abs/2501.04003)] |
-| <img width="95px" src="https://github.com/ldkong1205/ldkong1205/blob/master/Images/pi3det.png"> | **Perspective-Invariant 3D Object Detection**<br>[[GitHub Repo](https://github.com/pi3det/toolkit)] - [[Project Page]](https://pi3det.github.io/) - [[Paper](https://arxiv.org/abs/2507.17665)] |
-| <img width="95px" src="https://github.com/ldkong1205/ldkong1205/blob/master/Images/dynamiccity.webp"> | **DynamicCity: Large-Scale 4D Occupancy Generation from Dynamic Scenes**<br>[[GitHub Repo](https://github.com/3DTopia/DynamicCity)] - [[Project Page]](https://dynamic-city.github.io/) - [[Paper](https://arxiv.org/abs/2410.18084)] |
-| |
-
-
----
-
-<div align="center">
-
-<!-- ### 🌟 Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=iris0329/3eed&type=Date)](https://star-history.com/#iris0329/3eed&Date)
-
---- -->
-
-❤️ by the 3EED Team
-
-[⬆️ Back to Top](#3eed-ground-everything-everywhere-in-3d)
-
-</div>
+完整实验结果待补充。
