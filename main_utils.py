@@ -63,6 +63,11 @@ def parse_option():
     parser.add_argument("--proto_use_per", action="store_true")
     parser.add_argument("--num_platforms", type=int, default=3)
     parser.add_argument("--num_proto_classes", type=int, default=6)
+    parser.add_argument("--proto_score_momentum", type=float, default=0.9)
+    parser.add_argument("--proto_min_platform_samples", type=int, default=1)
+    parser.add_argument("--proto_min_platform_seen", type=int, default=5)
+    parser.add_argument("--proto_weak_pce_boost", type=float, default=1.0)
+    parser.add_argument("--proto_max_pce_boost", type=float, default=2.0)
 
     # Data
     parser.add_argument("--batch_size", type=int, default=8, help="Batch Size during training")
@@ -225,6 +230,9 @@ class BaseTrainTester:
         "proto_active",
         "pce_active",
         "per_active",
+        "status_ready",
+        "pce_rebalance_active",
+        "weak_pce_weight",
         "num_valid_samples",
         "num_active_platforms",
         "valid_platform_proto_count",
@@ -233,6 +241,20 @@ class BaseTrainTester:
         "weak_platform",
         "strong_platform",
     }
+    PROTO_STAT_PREFIXES = (
+        "platform_score_ema_",
+        "platform_seen_count_",
+        "platform_batch_score_",
+        "platform_batch_valid_",
+    )
+
+    @classmethod
+    def _is_proto_stat(cls, key):
+        return key in cls.PROTO_STAT_KEYS or key.startswith(cls.PROTO_STAT_PREFIXES)
+
+    @classmethod
+    def _is_logged_stat(cls, key):
+        return "loss" in key or "acc" in key or "ratio" in key or cls._is_proto_stat(key)
 
     def __init__(self, args):
         """Initialize."""
@@ -387,6 +409,11 @@ class BaseTrainTester:
             proto_warmup_epoch=args.proto_warmup_epoch,
             proto_use_pce=args.proto_use_pce,
             proto_use_per=args.proto_use_per,
+            proto_score_momentum=args.proto_score_momentum,
+            proto_min_platform_samples=args.proto_min_platform_samples,
+            proto_min_platform_seen=args.proto_min_platform_seen,
+            proto_weak_pce_boost=args.proto_weak_pce_boost,
+            proto_max_pce_boost=args.proto_max_pce_boost,
         )
         criterion = compute_hungarian_loss
 
@@ -499,7 +526,7 @@ class BaseTrainTester:
     @staticmethod
     def _accumulate_stats(stat_dict, end_points):
         for key in end_points:
-            if "loss" in key or "acc" in key or "ratio" in key or key in BaseTrainTester.PROTO_STAT_KEYS:
+            if BaseTrainTester._is_logged_stat(key):
                 if key not in stat_dict:
                     stat_dict[key] = 0
                 if isinstance(end_points[key], (float, int)):
@@ -554,7 +581,7 @@ class BaseTrainTester:
             if self.tb_writer:
                 global_step = epoch * len(train_loader) + batch_idx
                 for key in sorted(stat_dict.keys()):
-                    if ("loss" in key or key in self.PROTO_STAT_KEYS) and "proposal_" not in key and "last_" not in key and "head_" not in key:
+                    if self._is_logged_stat(key) and "proposal_" not in key and "last_" not in key and "head_" not in key:
                         self.tb_writer.add_scalar(f"Train/{key}", stat_dict[key] / args.print_freq, global_step)
 
             if (batch_idx + 1) % args.print_freq == 0:
@@ -566,7 +593,7 @@ class BaseTrainTester:
                         [
                             f"{key} {stat_dict[key] / args.print_freq:.4f} \t"
                             for key in sorted(stat_dict.keys())
-                            if ("loss" in key or key in self.PROTO_STAT_KEYS) and "proposal_" not in key and "last_" not in key and "head_" not in key
+                            if self._is_logged_stat(key) and "proposal_" not in key and "last_" not in key and "head_" not in key
                         ]
                     )
                 )
@@ -607,14 +634,14 @@ class BaseTrainTester:
                     [
                         f"{key} {stat_dict[key] / (float(batch_idx + 1)):.4f} \t"
                         for key in sorted(stat_dict.keys())
-                        if ("loss" in key or key in self.PROTO_STAT_KEYS) and "proposal_" not in key and "last_" not in key and "head_" not in key
+                        if self._is_logged_stat(key) and "proposal_" not in key and "last_" not in key and "head_" not in key
                     ]
                 )
             )
 
         if self.tb_writer:
             for key in sorted(stat_dict.keys()):
-                if ("loss" in key or key in self.PROTO_STAT_KEYS) and "proposal_" not in key and "last_" not in key and "head_" not in key:
+                if self._is_logged_stat(key) and "proposal_" not in key and "last_" not in key and "head_" not in key:
                     self.tb_writer.add_scalar(f"Eval/{key}", stat_dict[key] / (float(batch_idx + 1)), epoch * len(test_loader) + batch_idx)
 
         return stat_dict, end_points

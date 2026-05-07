@@ -358,6 +358,11 @@ class SetCriterion(nn.Module):
         proto_warmup_epoch=5,
         proto_use_pce=True,
         proto_use_per=True,
+        proto_score_momentum=0.9,
+        proto_min_platform_samples=1,
+        proto_min_platform_seen=5,
+        proto_weak_pce_boost=1.0,
+        proto_max_pce_boost=2.0,
     ):
         """
         Parameters:
@@ -386,6 +391,11 @@ class SetCriterion(nn.Module):
                 warmup_epoch=proto_warmup_epoch,
                 use_pce=proto_use_pce,
                 use_per=proto_use_per,
+                score_momentum=proto_score_momentum,
+                min_platform_samples=proto_min_platform_samples,
+                min_platform_seen=proto_min_platform_seen,
+                weak_pce_boost=proto_weak_pce_boost,
+                max_pce_boost=proto_max_pce_boost,
             )
 
     def loss_labels_st(self, outputs, targets, indices, num_boxes):
@@ -673,6 +683,9 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         end_points["proto_active"] = zero
         end_points["pce_active"] = zero
         end_points["per_active"] = zero
+        end_points["status_ready"] = zero
+        end_points["pce_rebalance_active"] = zero
+        end_points["weak_pce_weight"] = zero
         end_points["num_valid_samples"] = zero
         end_points["num_active_platforms"] = zero
         end_points["valid_platform_proto_count"] = zero
