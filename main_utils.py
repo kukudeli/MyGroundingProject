@@ -25,6 +25,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from models import HungarianMatcher, SetCriterion, compute_hungarian_loss
+from utils.platform_imbalance_probe import PlatformImbalanceProbe
 from utils import get_scheduler, setup_logger
 from tqdm import tqdm
 import shutil
@@ -68,6 +69,10 @@ def parse_option():
     parser.add_argument("--proto_min_platform_seen", type=int, default=5)
     parser.add_argument("--proto_weak_pce_boost", type=float, default=1.0)
     parser.add_argument("--proto_max_pce_boost", type=float, default=2.0)
+    parser.add_argument("--enable_platform_probe", action="store_true", help="Enable per-platform train-loss diagnostics.")
+    parser.add_argument("--platform_probe_freq", type=int, default=100, help="Run platform probe every N train batches.")
+    parser.add_argument("--platform_probe_warmup", type=int, default=1, help="Start platform probe from this epoch.")
+    parser.add_argument("--platform_probe_names", type=str, default=["waymo", "drone", "quad"], nargs="+", help="Platform id to name mapping.")
 
     # Data
     parser.add_argument("--batch_size", type=int, default=8, help="Batch Size during training")
@@ -288,7 +293,7 @@ class BaseTrainTester:
 
             # Backup code
             backup_files = ["main_utils.py", "prepare_data.py", "train_dist_mod.py"]
-            backup_dirs = ["models", "src", "utils", "scripts"]
+            backup_dirs = ["models", "src", "utils", "scripts", "tools"]
             backup_path = os.path.join(args.log_dir, "code_backup")
             os.makedirs(backup_path, exist_ok=True)
             self.backup_code(backup_files, backup_dirs, backup_path)
@@ -304,6 +309,18 @@ class BaseTrainTester:
             self.logger.info(f"TensorBoard logs at {tb_logdir}")
         else:
             self.tb_writer = None
+
+        self.platform_probe = None
+        if args.enable_platform_probe:
+            self.platform_probe = PlatformImbalanceProbe(
+                logger=self.logger,
+                tb_writer=self.tb_writer,
+                log_dir=args.log_dir,
+                platform_names=args.platform_probe_names,
+                freq=args.platform_probe_freq,
+            )
+            if dist.get_rank() == 0:
+                self.logger.info("Platform imbalance probe enabled.")
 
     @staticmethod
     def get_datasets(args):
@@ -567,6 +584,20 @@ class BaseTrainTester:
                 end_points[key] = batch_data[key]
             end_points["epoch"] = epoch
             loss, end_points = self._compute_loss(end_points, criterion, set_criterion, args)
+            global_step = epoch * len(train_loader) + batch_idx
+            if args.enable_platform_probe and self.platform_probe is not None and epoch >= args.platform_probe_warmup:
+                self.platform_probe.log_train_platform_loss(
+                    epoch=epoch,
+                    batch_idx=batch_idx,
+                    global_step=global_step,
+                    batch_data=batch_data,
+                    model=model,
+                    criterion=criterion,
+                    set_criterion=set_criterion,
+                    compute_loss_fn=self._compute_loss,
+                    get_inputs_fn=self._get_inputs,
+                    args=args,
+                )
             optimizer.zero_grad()
             loss.backward()
             if args.clip_norm > 0:
@@ -579,7 +610,6 @@ class BaseTrainTester:
             stat_dict = self._accumulate_stats(stat_dict, end_points)
 
             if self.tb_writer:
-                global_step = epoch * len(train_loader) + batch_idx
                 for key in sorted(stat_dict.keys()):
                     if self._is_logged_stat(key) and "proposal_" not in key and "last_" not in key and "head_" not in key:
                         self.tb_writer.add_scalar(f"Train/{key}", stat_dict[key] / args.print_freq, global_step)
