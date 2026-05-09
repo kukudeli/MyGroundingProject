@@ -1,7 +1,11 @@
 """Plot platform imbalance probe curves.
 
-Validation CSV is optional. If automatic per-platform validation export is not
-available, create a CSV manually with this format:
+Validation CSV is optional. The automatic export uses:
+
+epoch,platform_id,platform_name,acc25,acc50,miou,count
+
+If automatic per-platform validation export is not available, create a CSV
+manually with this older compatible format:
 
 epoch,platform,acc25,acc50,miou
 10,drone,35.2,18.7,0.241
@@ -73,19 +77,62 @@ def _plot_grouped_line(df, x_col, y_col, group_col, out_path, ylabel, smooth, pl
 
 def plot_train_csv(pd, plt, train_csv, out_dir, smooth):
     df = _read_csv(pd, train_csv, "train_csv")
-    required = {"epoch", "batch_idx", "global_step", "platform_id", "platform_name", "loss", "count"}
+    base_required = {"epoch", "batch_idx", "global_step", "platform_id", "platform_name", "count"}
+    has_total_loss = "total_loss" in df.columns
+    has_old_loss = "loss" in df.columns
+    has_box_loss = "box_loss" in df.columns
+    required = set(base_required)
+    if has_total_loss:
+        required.add("total_loss")
+    elif has_old_loss:
+        required.add("loss")
+    else:
+        raise SystemExit("train_csv must contain either total_loss or loss column.")
     missing = required - set(df.columns)
     if missing:
         raise SystemExit(f"train_csv missing required columns: {sorted(missing)}")
 
     x_col = "global_step"
-    _plot_grouped_line(df, x_col, "loss", "platform_name", os.path.join(out_dir, "platform_train_loss.png"), "loss", smooth, plt)
+    if has_total_loss:
+        _plot_grouped_line(
+            df,
+            x_col,
+            "total_loss",
+            "platform_name",
+            os.path.join(out_dir, "platform_train_total_loss.png"),
+            "total_loss",
+            smooth,
+            plt,
+        )
+    else:
+        _plot_grouped_line(df, x_col, "loss", "platform_name", os.path.join(out_dir, "platform_train_loss.png"), "loss", smooth, plt)
+
+    if has_box_loss:
+        box_df = df.dropna(subset=["box_loss"])
+        if not box_df.empty:
+            _plot_grouped_line(
+                box_df,
+                x_col,
+                "box_loss",
+                "platform_name",
+                os.path.join(out_dir, "platform_train_box_loss.png"),
+                "box_loss",
+                smooth,
+                plt,
+            )
     _plot_grouped_line(df, x_col, "count", "platform_name", os.path.join(out_dir, "platform_train_count.png"), "count", 0.0, plt)
 
 
 def plot_val_csv(pd, plt, val_csv, out_dir, smooth):
     df = _read_csv(pd, val_csv, "val_csv")
-    required = {"epoch", "platform", "acc25", "acc50", "miou"}
+    if "platform_name" in df.columns:
+        platform_col = "platform_name"
+    elif "platform" in df.columns:
+        platform_col = "platform"
+    else:
+        raise SystemExit("val_csv must contain either platform_name or platform column.")
+
+    required = {"epoch", platform_col, "acc25", "acc50", "miou"}
     missing = required - set(df.columns)
     if missing:
         raise SystemExit(f"val_csv missing required columns: {sorted(missing)}")
@@ -95,17 +142,18 @@ def plot_val_csv(pd, plt, val_csv, out_dir, smooth):
             df,
             "epoch",
             metric,
-            "platform",
+            platform_col,
             os.path.join(out_dir, f"platform_val_{metric}.png"),
             metric,
             smooth,
             plt,
         )
 
-    pivot = df.pivot_table(index="epoch", columns="platform", values=["acc25", "acc50", "miou"], aggfunc="mean").sort_index()
+    pivot = df.pivot_table(index="epoch", columns=platform_col, values=["acc25", "acc50", "miou"], aggfunc="mean").sort_index()
     platforms = set(pivot.columns.get_level_values(1))
     if "drone" not in platforms or "quad" not in platforms:
-        raise SystemExit("val_csv must contain both drone and quad rows to plot platform_val_gap.png.")
+        print("Warning: val_csv does not contain both drone and quad rows; skip platform_val_gap.png.")
+        return
 
     gap_df = pd.DataFrame(index=pivot.index)
     gap_df["gap_acc25"] = (pivot[("acc25", "drone")] - pivot[("acc25", "quad")]).abs()

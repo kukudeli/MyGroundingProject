@@ -4,9 +4,6 @@ from models.losses import _iou3d_par, box_cxcyczwhd_to_xyzxyz
 from utils.eval_det import iou3d_rotated_vs_aligned
 import utils.misc as misc
 from collections import defaultdict
-import ipdb
-
-st = ipdb.set_trace
 
 
 class GroundingEvaluator:
@@ -184,7 +181,6 @@ class GroundingEvaluator:
             prefix (str): layer name, e.g., "last_" or "proposal_"
         """
         # ============ 1. Parse Ground Truth ============
-        # ipdb.set_trace() # TODO if using batch_data["gt_bboxes"]
         # positive_map, gt_bboxes = self._parse_gt(end_points)
         # Get original GT bboxes from batch_data (with rotation)
         positive_map = torch.clone(end_points["positive_map"])
@@ -223,6 +219,9 @@ class GroundingEvaluator:
         sem_scores[:, : sem_scores_.size(1), : sem_scores_.size(2)] = sem_scores_
 
         # ============ 4. Evaluate per sample ============
+        iou_per_sample = []
+        acc25_per_sample = []
+        acc50_per_sample = []
         for bid in range(len(positive_map)):  # iterate over each sample in batch
             # 4.1 Get valid number of GT objects
             num_obj = int(end_points["box_label_mask"][bid].sum())  # how many GTs in current sample
@@ -248,7 +247,6 @@ class GroundingEvaluator:
             pbox = pred_bbox[bid, top.reshape(-1)]  # (10, 6) - [cx,cy,cz,w,h,d] axis-aligned
             # Pick these 10 best-matching predicted boxes from 256 candidates
 
-            # ipdb.set_trace() # TODO print gt_bboxes_rotated[bid][:num_obj]
             # 4.4 Compute IoU
             # ious, _ = _iou3d_par(
             #     box_cxcyczwhd_to_xyzxyz(gt_bboxes[bid][:num_obj]),  # (1, 6) - gt bbox
@@ -281,6 +279,10 @@ class GroundingEvaluator:
             # Accumulate mean IoU (for mIoU)
             self.dets["iou"] += ious[:, 0].cpu().numpy().sum()
             self.dets["num_iou"] += num_obj
+            top1_iou = ious[:, 0].mean()
+            iou_per_sample.append(top1_iou.detach())
+            acc25_per_sample.append((top1_iou > 0.25).float().detach())
+            acc50_per_sample.append((top1_iou > 0.5).float().detach())
 
             # ============ 5. Compute accuracy metrics ============
             # Iterate different IoU thresholds (0.25, 0.5)
@@ -308,6 +310,11 @@ class GroundingEvaluator:
                     if prefix == "last_" and k == 1:
                         self.dets[("total_acc", t, "bbf")] += all_found
                         self.gts[("total_acc", t, "bbf")] += 1
+
+        if prefix == "last_" and len(iou_per_sample) > 0:
+            end_points["iou_per_sample"] = torch.stack(iou_per_sample).to(pred_bbox.device)
+            end_points["acc25_per_sample"] = torch.stack(acc25_per_sample).to(pred_bbox.device)
+            end_points["acc50_per_sample"] = torch.stack(acc50_per_sample).to(pred_bbox.device)
 
     def _parse_gt(self, end_points):
         positive_map = torch.clone(end_points["positive_map"])  # (B, K, 256)

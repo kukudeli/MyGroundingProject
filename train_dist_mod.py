@@ -10,13 +10,10 @@ from main_utils import parse_option, BaseTrainTester
 # from data.model_util_scannet import ScannetDatasetConfig  # disabled for 3EED smoke test
 from src.joint_det_dataset import Joint3DDataset
 from src.grounding_evaluator import GroundingEvaluator#, GroundingGTEvaluator
+from utils.platform_imbalance_probe import PlatformValidationRecorder
 from models import BeaUTyDETR
 from models import APCalculator, parse_predictions, parse_groundtruths
 from tqdm import tqdm
-
-import ipdb
-
-st = ipdb.set_trace
 
 
 class TrainTester(BaseTrainTester):
@@ -140,6 +137,13 @@ class TrainTester(BaseTrainTester):
         thres = [0.25, 0.5]  # [0.25, 0.5, 0.7, 0.9]
 
         evaluator = GroundingEvaluator(only_root=False, thresholds=thres, topks=[1, 5, 10], prefixes=prefixes)
+        platform_val_recorder = None
+        if args.enable_platform_probe:
+            platform_val_recorder = PlatformValidationRecorder(
+                logger=self.logger,
+                log_dir=args.log_dir,
+                platform_names=args.platform_probe_names,
+            )
 
         # Main eval branch
         for batch_idx, batch_data in tqdm(enumerate(test_loader), total=len(test_loader), desc=f"Eval epoch {epoch}"):
@@ -152,12 +156,16 @@ class TrainTester(BaseTrainTester):
                 for prefix in prefixes:  # ['last_', 'proposal_', '0head_', '1head_', '2head_', '3head_', '4head_']
                     # evaluator.evaluate(end_points, prefix)
                     evaluator.evaluate(batch_data, end_points, prefix)
+                    if prefix == "last_" and platform_val_recorder is not None:
+                        platform_val_recorder.update(epoch, batch_data, end_points)
 
         evaluator.synchronize_between_processes()
         if dist.get_rank() == 0:
             if evaluator is not None:
                 return_str = evaluator.print_stats()
                 self.logger.info(return_str)
+        if platform_val_recorder is not None:
+            platform_val_recorder.finalize(epoch)
 
         # Record accuracy in tensorboard
         if self.tb_writer is not None:
@@ -193,10 +201,6 @@ class TrainTester(BaseTrainTester):
             model: a nn.Module that returns end_points (dict)
             criterion: a function that returns (loss, end_points)
         """
-        import pdb
-
-        pdb.set_trace()
-
         from data.model_util_scannet import ScannetDatasetConfig
         dataset_config = ScannetDatasetConfig(18)
         # Used for AP calculation

@@ -1,3 +1,4 @@
+# This script is used for multi-platform diagnostic experiments, so platform probe is enabled by default.
 TORCH_DISTRIBUTED_DEBUG=INFO CUDA_VISIBLE_DEVICES=5 python -m torch.distributed.launch --nproc_per_node 1 --master_port $((RANDOM % 30000 + 20000)) \
     train_dist_mod.py --num_decoder_layers 6 \
     --use_color \
@@ -12,4 +13,7 @@ TORCH_DISTRIBUTED_DEBUG=INFO CUDA_VISIBLE_DEVICES=5 python -m torch.distributed.
     --lr_decay_epochs 25 26 \
     --use_soft_token_loss --use_contrastive_align \
     --log_dir logs \
-    --self_attend 
+    --self_attend \
+    --enable_platform_probe \
+    --platform_probe_freq 100 \
+    --platform_probe_warmup 1

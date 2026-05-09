@@ -22,7 +22,6 @@ from ops.teed_pointnet.roiaware_pool3d.roiaware_pool3d_utils import points_in_bo
 from utils.box_util import extract_points_in_bbox_3d, project_points_to_2d, draw_points_on_image, conver_box2d, draw_projected_box3d
 from PIL import Image
 import pickle
-import ipdb
 # ==================== Constants ====================
 MAX_NUM_OBJ = 132
 
@@ -525,8 +524,6 @@ class Joint3DDataset(Dataset):
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             cv2.imwrite(save_path, proj_pcd_image)
             print(f"    Projected point cloud image saved: {save_path}") 
-            
-            ipdb.set_trace()
             
             # Project 3D bbox onto 2D image
             bbox_3d_corners, _ = conver_box2d(bbox, image.size, anno)

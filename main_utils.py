@@ -30,7 +30,6 @@ from utils import get_scheduler, setup_logger
 from tqdm import tqdm
 import shutil
 from torch.utils.tensorboard import SummaryWriter
-import ipdb
 
 
 def parse_option():
@@ -299,9 +298,6 @@ class BaseTrainTester:
             self.backup_code(backup_files, backup_dirs, backup_path)
             self.logger.info(f"Code backup completed at {backup_path}")
 
-        # import pdb
-
-        # pdb.set_trace()
         # Initialize TensorBoard only in main process
         if dist.get_rank() == 0:
             tb_logdir = os.path.join(args.log_dir, "tensorboard")
@@ -467,7 +463,6 @@ class BaseTrainTester:
         assert len(test_loader.dataset) > 0, f"test set is empty"
         
         # Get model
-        # ipdb.set_trace()
         model = self.get_model(args)
 
         # Get criterion
