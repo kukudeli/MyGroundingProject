@@ -580,6 +580,13 @@ class BaseTrainTester:
             end_points["epoch"] = epoch
             loss, end_points = self._compute_loss(end_points, criterion, set_criterion, args)
             global_step = epoch * len(train_loader) + batch_idx
+            optimizer.zero_grad()
+            loss.backward()
+            if args.clip_norm > 0:
+                grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
+                stat_dict["grad_norm"] = grad_total_norm
+            optimizer.step()
+            scheduler.step()
             if args.enable_platform_probe and self.platform_probe is not None and epoch >= args.platform_probe_warmup:
                 self.platform_probe.log_train_platform_loss(
                     epoch=epoch,
@@ -593,13 +600,6 @@ class BaseTrainTester:
                     get_inputs_fn=self._get_inputs,
                     args=args,
                 )
-            optimizer.zero_grad()
-            loss.backward()
-            if args.clip_norm > 0:
-                grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
-                stat_dict["grad_norm"] = grad_total_norm
-            optimizer.step()
-            scheduler.step()
 
             # Accumulate statistics and print out
             stat_dict = self._accumulate_stats(stat_dict, end_points)
