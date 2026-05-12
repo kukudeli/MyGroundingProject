@@ -190,8 +190,6 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         num_active_platforms = int(platform_labels.unique().numel())
 
         z = F.normalize(self.projector(features), p=2, dim=-1)
-        self._update_prototypes(z.detach(), platform_labels, class_labels)
-
         sample_proto, platform_initialized, global_initialized, fallback_mask = self._build_sample_prototypes(platform_labels)
         logits = torch.bmm(sample_proto, z.unsqueeze(-1)).squeeze(-1) / self.temperature
         logits = logits.clamp(min=-50.0, max=50.0)
@@ -239,6 +237,7 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         valid_platform_proto_count = int(self.prototype_initialized.sum().item())
         valid_global_proto_count = int(self.global_prototype_initialized.sum().item())
         fallback_proto_count = int(fallback_mask.sum().item())
+        self._update_prototypes(z.detach(), platform_labels, class_labels)
         return loss_proto, self._stats(
             loss_pce,
             loss_per,
