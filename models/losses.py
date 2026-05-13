@@ -358,6 +358,7 @@ class SetCriterion(nn.Module):
         proto_warmup_epoch=5,
         proto_use_pce=True,
         proto_use_per=True,
+        proto_feature_mode="matched_query",
         proto_score_momentum=0.9,
         proto_min_platform_samples=1,
         proto_min_platform_seen=5,
@@ -377,6 +378,7 @@ class SetCriterion(nn.Module):
         self.losses = losses
         self.temperature = temperature
         self.use_platform_proto = use_platform_proto
+        self.proto_feature_mode = proto_feature_mode
         if self.use_platform_proto:
             self.platform_proto_loss = PlatformPrototypeRebalanceLoss(
                 in_dim=proto_in_dim,
@@ -589,6 +591,43 @@ class SetCriterion(nn.Module):
         return losses, indices
 
 
+def extract_matched_query_features(proto_query_features, indices, targets, platform_labels):
+    """Flatten final-layer Hungarian matched query features and labels."""
+    device = proto_query_features.device
+    matched_features = []
+    matched_platform_labels = []
+    matched_class_labels = []
+
+    for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
+        if len(src_idx) == 0 or len(tgt_idx) == 0:
+            continue
+
+        src_idx = src_idx.to(device=device, dtype=torch.long)
+        tgt_idx = tgt_idx.to(device=targets[batch_idx]["labels"].device, dtype=torch.long)
+
+        features = proto_query_features[batch_idx, src_idx]
+        labels = targets[batch_idx]["labels"][tgt_idx].to(device=device, dtype=torch.long)
+        platforms = platform_labels[batch_idx].to(device=device, dtype=torch.long).expand(labels.shape[0])
+
+        matched_features.append(features)
+        matched_platform_labels.append(platforms)
+        matched_class_labels.append(labels)
+
+    if len(matched_features) == 0:
+        feature_dim = proto_query_features.shape[-1]
+        return (
+            proto_query_features.new_zeros((0, feature_dim)),
+            platform_labels.new_zeros((0,), dtype=torch.long).to(device),
+            platform_labels.new_zeros((0,), dtype=torch.long).to(device),
+        )
+
+    return (
+        torch.cat(matched_features, dim=0),
+        torch.cat(matched_platform_labels, dim=0),
+        torch.cat(matched_class_labels, dim=0),
+    )
+
+
 def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
                            query_points_obj_topk=5):
     """Compute Hungarian matching loss containing CE, bbox and giou."""
@@ -612,6 +651,7 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
     ]
 
     loss_ce, loss_bbox, loss_giou, loss_contrastive_align = 0, 0, 0, 0
+    last_layer_indices = None
     for prefix in prefixes:
         output = {}
         if 'proj_tokens' in end_points:
@@ -628,7 +668,9 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         output["pred_boxes"] = pred_bbox
 
         # Compute all the requested losses
-        losses, _ = set_criterion(output, target)
+        losses, indices = set_criterion(output, target)
+        if prefix == "last_":
+            last_layer_indices = indices
         for loss_key in losses.keys():
             end_points[f'{prefix}_{loss_key}'] = losses[loss_key]
         loss_ce += losses.get('loss_ce', 0)
@@ -660,14 +702,27 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
     end_points['query_points_generation_loss'] = query_points_generation_loss
     end_points['loss_constrastive_align'] = loss_contrastive_align
     if set_criterion.use_platform_proto and set_criterion.training:
-        proto_features = end_points["proto_features"]
         platform_labels = end_points["platform_label"].long()
-        class_labels = end_points["sem_cls_label"][:, 0].long()
-        valid_mask = end_points["box_label_mask"][:, 0].bool()
+        if set_criterion.proto_feature_mode == "mean_query":
+            proto_features = end_points.get("proto_features", end_points["proto_query_features"].mean(dim=1))
+            class_labels = end_points["sem_cls_label"][:, 0].long()
+            valid_mask = end_points["box_label_mask"][:, 0].bool()
+            proto_features = proto_features[valid_mask]
+            platform_labels = platform_labels[valid_mask]
+            class_labels = class_labels[valid_mask]
+        elif set_criterion.proto_feature_mode == "matched_query":
+            proto_features, platform_labels, class_labels = extract_matched_query_features(
+                end_points["proto_query_features"],
+                last_layer_indices if last_layer_indices is not None else [],
+                target,
+                platform_labels,
+            )
+        else:
+            raise ValueError(f"Unknown proto_feature_mode: {set_criterion.proto_feature_mode}")
         loss_proto, proto_stats = set_criterion.platform_proto_loss(
-            proto_features[valid_mask],
-            platform_labels[valid_mask],
-            class_labels[valid_mask],
+            proto_features,
+            platform_labels,
+            class_labels,
             epoch=end_points.get("epoch", None),
         )
         loss = loss + loss_proto

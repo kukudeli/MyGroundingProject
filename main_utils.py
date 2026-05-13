@@ -61,6 +61,7 @@ def parse_option():
     parser.add_argument("--proto_warmup_epoch", type=int, default=5)
     parser.add_argument("--proto_use_pce", action="store_true")
     parser.add_argument("--proto_use_per", action="store_true")
+    parser.add_argument("--proto_feature_mode", type=str, default="matched_query", choices=["mean_query", "matched_query"])
     parser.add_argument("--num_platforms", type=int, default=3)
     parser.add_argument("--num_proto_classes", type=int, default=6)
     parser.add_argument("--proto_score_momentum", type=float, default=0.9)
@@ -422,6 +423,7 @@ class BaseTrainTester:
             proto_warmup_epoch=args.proto_warmup_epoch,
             proto_use_pce=args.proto_use_pce,
             proto_use_per=args.proto_use_per,
+            proto_feature_mode=args.proto_feature_mode,
             proto_score_momentum=args.proto_score_momentum,
             proto_min_platform_samples=args.proto_min_platform_samples,
             proto_min_platform_seen=args.proto_min_platform_seen,
