@@ -32,6 +32,8 @@ case "${MODE}" in
             --proto_use_pce
             --proto_pce_weight 0.1
             --proto_per_weight 0.0
+            --proto_feature_mode matched_query
+            --proto_status_mode box_difficulty
             --proto_score_momentum 0.9
             --proto_min_platform_samples 1
             --proto_min_platform_seen 5
@@ -45,7 +47,9 @@ case "${MODE}" in
             --proto_use_per
             --proto_pce_weight 0.0
             --proto_per_weight 0.01
-            --proto_warmup_epoch 5
+            --proto_warmup_epoch 0
+            --proto_feature_mode matched_query
+            --proto_status_mode box_difficulty
             --proto_score_momentum 0.9
             --proto_min_platform_samples 1
             --proto_min_platform_seen 5
@@ -60,7 +64,9 @@ case "${MODE}" in
             --proto_use_per
             --proto_pce_weight 0.1
             --proto_per_weight 0.01
-            --proto_warmup_epoch 5
+            --proto_warmup_epoch 0
+            --proto_feature_mode matched_query
+            --proto_status_mode box_difficulty
             --proto_score_momentum 0.9
             --proto_min_platform_samples 1
             --proto_min_platform_seen 5

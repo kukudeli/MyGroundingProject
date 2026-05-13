@@ -27,6 +27,7 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         min_platform_seen=5,
         weak_pce_boost=1.0,
         max_pce_boost=2.0,
+        status_mode="box_difficulty",
     ):
         super().__init__()
         self.projector = nn.Sequential(
@@ -49,6 +50,7 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         self.min_platform_seen = min_platform_seen
         self.weak_pce_boost = weak_pce_boost
         self.max_pce_boost = max_pce_boost
+        self.status_mode = status_mode
 
         self.register_buffer("prototypes", torch.zeros(num_platforms, num_classes, proto_dim))
         self.register_buffer("prototype_initialized", torch.zeros(num_platforms, num_classes, dtype=torch.bool))
@@ -119,11 +121,11 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         return sample_proto, platform_initialized, global_initialized, fallback_mask
 
     @torch.no_grad()
-    def _update_platform_status(self, true_probs, platform_labels):
-        device = true_probs.device
+    def _update_platform_status(self, status_values, platform_labels):
+        device = status_values.device
         batch_scores = torch.zeros(self.num_platforms, device=device)
         batch_valid = torch.zeros(self.num_platforms, dtype=torch.bool, device=device)
-        true_probs = true_probs.detach()
+        status_values = status_values.detach()
         for platform in platform_labels.unique():
             platform_idx = int(platform.item())
             if platform_idx < 0 or platform_idx >= self.num_platforms:
@@ -132,7 +134,7 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
             num_samples = int(mask.sum().item())
             if num_samples < self.min_platform_samples:
                 continue
-            batch_score = true_probs[mask].mean()
+            batch_score = status_values[mask].mean()
             batch_scores[platform_idx] = batch_score
             batch_valid[platform_idx] = True
             if self.platform_score_initialized[platform_idx]:
@@ -154,14 +156,23 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
 
         ready_indices = torch.nonzero(ready_mask, as_tuple=False).squeeze(1)
         ready_scores = self.platform_score_ema[ready_indices]
-        strong_pos = torch.argmax(ready_scores)
-        weak_pos = torch.argmin(ready_scores)
+        if self.status_mode == "proto_confidence":
+            strong_pos = torch.argmax(ready_scores)
+            weak_pos = torch.argmin(ready_scores)
+            platform_gap = ready_scores[strong_pos] - ready_scores[weak_pos]
+        elif self.status_mode == "box_difficulty":
+            weak_pos = torch.argmax(ready_scores)
+            strong_pos = torch.argmin(ready_scores)
+            weak_score = ready_scores[weak_pos]
+            strong_score = ready_scores[strong_pos]
+            platform_gap = (weak_score - strong_score) / (0.5 * (weak_score + strong_score) + 1e-6)
+        else:
+            raise ValueError(f"Unknown status_mode: {self.status_mode}")
         strong_platform = int(ready_indices[strong_pos].item())
         weak_platform = int(ready_indices[weak_pos].item())
-        platform_gap = ready_scores[strong_pos] - ready_scores[weak_pos]
         return strong_platform, weak_platform, platform_gap, True
 
-    def forward(self, features, platform_labels, class_labels, epoch=None):
+    def forward(self, features, platform_labels, class_labels, status_values=None, epoch=None):
         device = features.device
         if features.numel() == 0:
             zero = self._zero(features)
@@ -186,6 +197,8 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         features = features[valid]
         platform_labels = platform_labels[valid]
         class_labels = class_labels[valid]
+        if status_values is not None:
+            status_values = status_values.to(device=device, dtype=features.dtype)[valid]
         num_valid_samples = int(features.shape[0])
         num_active_platforms = int(platform_labels.unique().numel())
 
@@ -195,8 +208,16 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         logits = logits.clamp(min=-50.0, max=50.0)
 
         probs = F.softmax(logits, dim=-1)
-        true_probs = probs.gather(1, class_labels.unsqueeze(1)).squeeze(1)
-        batch_scores, batch_valid, _ = self._update_platform_status(true_probs.detach(), platform_labels)
+        if self.status_mode == "proto_confidence":
+            platform_status_values = probs.gather(1, class_labels.unsqueeze(1)).squeeze(1).detach()
+        elif self.status_mode == "box_difficulty":
+            if status_values is None:
+                platform_status_values = features.new_zeros((features.shape[0],))
+            else:
+                platform_status_values = status_values.detach()
+        else:
+            raise ValueError(f"Unknown status_mode: {self.status_mode}")
+        batch_scores, batch_valid, _ = self._update_platform_status(platform_status_values, platform_labels)
         strong_platform, weak_platform, platform_gap, status_ready = self._select_strong_weak_platforms()
 
         gap_over_threshold = bool(platform_gap.detach().item() > self.gap_threshold)

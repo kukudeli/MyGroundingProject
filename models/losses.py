@@ -359,6 +359,7 @@ class SetCriterion(nn.Module):
         proto_use_pce=True,
         proto_use_per=True,
         proto_feature_mode="matched_query",
+        proto_status_mode="box_difficulty",
         proto_score_momentum=0.9,
         proto_min_platform_samples=1,
         proto_min_platform_seen=5,
@@ -379,6 +380,7 @@ class SetCriterion(nn.Module):
         self.temperature = temperature
         self.use_platform_proto = use_platform_proto
         self.proto_feature_mode = proto_feature_mode
+        self.proto_status_mode = proto_status_mode
         if self.use_platform_proto:
             self.platform_proto_loss = PlatformPrototypeRebalanceLoss(
                 in_dim=proto_in_dim,
@@ -393,6 +395,7 @@ class SetCriterion(nn.Module):
                 warmup_epoch=proto_warmup_epoch,
                 use_pce=proto_use_pce,
                 use_per=proto_use_per,
+                status_mode=proto_status_mode,
                 score_momentum=proto_score_momentum,
                 min_platform_samples=proto_min_platform_samples,
                 min_platform_seen=proto_min_platform_seen,
@@ -591,12 +594,22 @@ class SetCriterion(nn.Module):
         return losses, indices
 
 
-def extract_matched_query_features(proto_query_features, indices, targets, platform_labels):
-    """Flatten final-layer Hungarian matched query features and labels."""
+def extract_matched_query_features_and_box_difficulty(
+    proto_query_features,
+    last_pred_boxes,
+    indices,
+    targets,
+    platform_labels,
+):
+    """Flatten final-layer matches into prototype features and box difficulty."""
     device = proto_query_features.device
     matched_features = []
     matched_platform_labels = []
     matched_class_labels = []
+    matched_box_difficulty = []
+
+    if last_pred_boxes is None:
+        indices = []
 
     for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
         if len(src_idx) == 0 or len(tgt_idx) == 0:
@@ -606,12 +619,33 @@ def extract_matched_query_features(proto_query_features, indices, targets, platf
         tgt_idx = tgt_idx.to(device=targets[batch_idx]["labels"].device, dtype=torch.long)
 
         features = proto_query_features[batch_idx, src_idx]
+        pred_boxes = last_pred_boxes[batch_idx, src_idx]
+        gt_boxes = targets[batch_idx]["boxes"][tgt_idx].to(device=device)
         labels = targets[batch_idx]["labels"][tgt_idx].to(device=device, dtype=torch.long)
         platforms = platform_labels[batch_idx].to(device=device, dtype=torch.long).expand(labels.shape[0])
+        with torch.no_grad():
+            bbox_l1 = (
+                F.l1_loss(
+                    pred_boxes[..., :3],
+                    gt_boxes[..., :3],
+                    reduction="none",
+                ).sum(dim=-1)
+                + 0.2 * F.l1_loss(
+                    pred_boxes[..., 3:],
+                    gt_boxes[..., 3:],
+                    reduction="none",
+                ).sum(dim=-1)
+            )
+            giou_each = 1 - torch.diag(generalized_box_iou3d(
+                box_cxcyczwhd_to_xyzxyz(pred_boxes),
+                box_cxcyczwhd_to_xyzxyz(gt_boxes),
+            ))
+            difficulty = (bbox_l1 + giou_each).detach()
 
         matched_features.append(features)
         matched_platform_labels.append(platforms)
         matched_class_labels.append(labels)
+        matched_box_difficulty.append(difficulty)
 
     if len(matched_features) == 0:
         feature_dim = proto_query_features.shape[-1]
@@ -619,12 +653,14 @@ def extract_matched_query_features(proto_query_features, indices, targets, platf
             proto_query_features.new_zeros((0, feature_dim)),
             platform_labels.new_zeros((0,), dtype=torch.long).to(device),
             platform_labels.new_zeros((0,), dtype=torch.long).to(device),
+            proto_query_features.new_zeros((0,)),
         )
 
     return (
         torch.cat(matched_features, dim=0),
         torch.cat(matched_platform_labels, dim=0),
         torch.cat(matched_class_labels, dim=0),
+        torch.cat(matched_box_difficulty, dim=0),
     )
 
 
@@ -652,6 +688,7 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
 
     loss_ce, loss_bbox, loss_giou, loss_contrastive_align = 0, 0, 0, 0
     last_layer_indices = None
+    last_layer_pred_boxes = None
     for prefix in prefixes:
         output = {}
         if 'proj_tokens' in end_points:
@@ -671,6 +708,7 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         losses, indices = set_criterion(output, target)
         if prefix == "last_":
             last_layer_indices = indices
+            last_layer_pred_boxes = pred_bbox
         for loss_key in losses.keys():
             end_points[f'{prefix}_{loss_key}'] = losses[loss_key]
         loss_ce += losses.get('loss_ce', 0)
@@ -703,7 +741,12 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
     end_points['loss_constrastive_align'] = loss_contrastive_align
     if set_criterion.use_platform_proto and set_criterion.training:
         platform_labels = end_points["platform_label"].long()
+        status_values = None
         if set_criterion.proto_feature_mode == "mean_query":
+            if set_criterion.proto_status_mode == "box_difficulty":
+                raise ValueError(
+                    "box_difficulty status mode currently requires matched_query feature mode."
+                )
             proto_features = end_points.get("proto_features", end_points["proto_query_features"].mean(dim=1))
             class_labels = end_points["sem_cls_label"][:, 0].long()
             valid_mask = end_points["box_label_mask"][:, 0].bool()
@@ -711,18 +754,26 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
             platform_labels = platform_labels[valid_mask]
             class_labels = class_labels[valid_mask]
         elif set_criterion.proto_feature_mode == "matched_query":
-            proto_features, platform_labels, class_labels = extract_matched_query_features(
+            proto_features, platform_labels, class_labels, matched_box_difficulty = extract_matched_query_features_and_box_difficulty(
                 end_points["proto_query_features"],
+                last_layer_pred_boxes,
                 last_layer_indices if last_layer_indices is not None else [],
                 target,
                 platform_labels,
             )
+            if set_criterion.proto_status_mode == "box_difficulty":
+                status_values = matched_box_difficulty
+            elif set_criterion.proto_status_mode == "proto_confidence":
+                status_values = None
+            else:
+                raise ValueError(f"Unknown proto_status_mode: {set_criterion.proto_status_mode}")
         else:
             raise ValueError(f"Unknown proto_feature_mode: {set_criterion.proto_feature_mode}")
         loss_proto, proto_stats = set_criterion.platform_proto_loss(
             proto_features,
             platform_labels,
             class_labels,
+            status_values=status_values,
             epoch=end_points.get("epoch", None),
         )
         loss = loss + loss_proto
