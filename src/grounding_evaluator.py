@@ -267,14 +267,25 @@ class GroundingEvaluator:
             sequence = meta_path.split("/")[-3]
             frame = meta_path.split("/")[-2]
 
-            record = {
-                "id": f"{dataset}/{sequence}/{frame}",
-                "utterance": batch_data["utterances"][bid],
-                "gt_box": batch_data["gt_bboxes"][bid][:num_obj].cpu().numpy().tolist(), # (1, 7/9) - keep full rotation
-                "pred_box": pbox[0].cpu().numpy().tolist(),  # top-1 predicted box
-                "ious": ious[:, 0].cpu().numpy().tolist(),  # IoU of top-1
-            }
-            self.prediction_records.append(record)
+            if prefix == "last_":
+                record = {
+                    "id": f"{dataset}/{sequence}/{frame}",
+                    "platform": dataset,
+                    "meta_path": meta_path,
+                    "utterance": batch_data["utterances"][bid],
+                    "gt_box": batch_data["gt_bboxes"][bid][:num_obj].cpu().numpy().tolist(), # (1, 7/9) - keep full rotation
+                    "top1_pred_box": pbox[0].detach().cpu().numpy().tolist(),
+                    "top10_pred_boxes": pbox.detach().cpu().numpy().tolist(),
+                    "top10_ious": ious[0].detach().cpu().numpy().tolist(),
+                    "top1_iou": float(ious[0, 0].detach().cpu().item()),
+                    "max_top5_iou": float(ious[0, :5].max().detach().cpu().item()),
+                    "max_top10_iou": float(ious[0, :10].max().detach().cpu().item()),
+                    "acc25_top1": int((ious[0, 0] > 0.25).detach().cpu().item()),
+                    "acc50_top1": int((ious[0, 0] > 0.5).detach().cpu().item()),
+                    "acc25_top10": int((ious[0, :10].max() > 0.25).detach().cpu().item()),
+                    "acc50_top10": int((ious[0, :10].max() > 0.5).detach().cpu().item()),
+                }
+                self.prediction_records.append(record)
 
             # Accumulate mean IoU (for mIoU)
             self.dets["iou"] += ious[:, 0].cpu().numpy().sum()

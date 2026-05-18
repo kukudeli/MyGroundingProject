@@ -186,9 +186,9 @@ class TrainTester(BaseTrainTester):
             save_path = os.path.join(self.log_dir, f"predictions/{save_id}")
             os.makedirs(save_path, exist_ok=True)
             save_json = os.path.join(save_path, "prediction.json")
-            with open(save_json, "w") as f:
-                json.dump(pred, f, indent=4)
-        print("\033[92mSaved predictions at", self.log_dir, "\033[0m")
+            with open(save_json, "w", encoding="utf-8") as f:
+                json.dump(pred, f, indent=4, ensure_ascii=False)
+        print(f"\033[92mSaved {len(preds)} last-head prediction records at {self.log_dir}\033[0m")
 
         return None
 
