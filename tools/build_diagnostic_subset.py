@@ -10,11 +10,13 @@ Example:
       --quad_root logs/Train_drone_quad_Val_drone_quad/ablation_baseline_dq/eval/Val_quad/0520_1225/predictions \
       --out_dir outputs/diagnostic_baseline20_dq \
       --samples_per_group 20 \
+      --samples_per_scene 5 \
       --seed 42
 """
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import random
@@ -53,6 +55,8 @@ PRIMARY_LABELS = (
 
 CSV_COLUMNS = (
     "platform",
+    "scene",
+    "frame_id",
     "id",
     "utterance",
     "top1_iou",
@@ -60,6 +64,7 @@ CSV_COLUMNS = (
     "max_top10_iou",
     "acc25_top1",
     "acc50_top1",
+    "acc25_top10",
     "acc50_top10",
     "primary_label",
     "flag_A_recall_fail_25",
@@ -73,12 +78,36 @@ CSV_COLUMNS = (
 SAMPLE_COLUMNS = (
     "id",
     "platform",
+    "scene",
+    "frame_id",
     "utterance",
     "top1_iou",
     "max_top5_iou",
     "max_top10_iou",
     "primary_label",
     "json_path",
+)
+
+MANUAL_REVIEW_COLUMNS = (
+    "id",
+    "platform",
+    "scene",
+    "frame_id",
+    "primary_label",
+    "utterance",
+    "top1_iou",
+    "max_top5_iou",
+    "max_top10_iou",
+    "json_path",
+    "manual_target_size",
+    "manual_distance",
+    "manual_density",
+    "manual_occlusion",
+    "manual_similar_objects",
+    "manual_edge_or_truncation",
+    "manual_language_complexity",
+    "manual_failure_reason",
+    "manual_notes",
 )
 
 
@@ -90,6 +119,12 @@ def parse_args():
     parser.add_argument("--quad_root", default=DEFAULT_QUAD_ROOT, help="Root directory containing Quad prediction.json files.")
     parser.add_argument("--out_dir", default=DEFAULT_OUT_DIR, help="Directory to save diagnostic outputs.")
     parser.add_argument("--samples_per_group", type=int, default=20, help="Number of samples per platform and primary label.")
+    parser.add_argument(
+        "--samples_per_scene",
+        type=int,
+        default=5,
+        help="Maximum number of samples per platform, scene, and primary label for scene-balanced outputs.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed used for fixed sampling.")
     return parser.parse_args()
 
@@ -192,10 +227,22 @@ def compute_flags(top1_iou, max_top10_iou):
     return flags, primary_label
 
 
+def parse_id_fields(record_id):
+    if record_id is None:
+        return "", "", ""
+
+    parts = str(record_id).replace("\\", "/").split("/")
+    platform_from_id = parts[0] if len(parts) >= 1 else ""
+    scene = parts[1] if len(parts) >= 2 else ""
+    frame_id = parts[2] if len(parts) >= 3 else ""
+    return platform_from_id, scene, frame_id
+
+
 def annotate_record(record, json_path, platform_hint):
     record = dict(record)
+    platform_from_id, scene, frame_id = parse_id_fields(record.get("id"))
     if not record.get("platform"):
-        record["platform"] = platform_hint
+        record["platform"] = platform_from_id or platform_hint
 
     top1_iou = require_numeric(record, "top1_iou", json_path)
     max_top5_iou = require_numeric(record, "max_top5_iou", json_path)
@@ -206,6 +253,8 @@ def annotate_record(record, json_path, platform_hint):
     record["top1_iou"] = top1_iou
     record["max_top5_iou"] = max_top5_iou
     record["max_top10_iou"] = max_top10_iou
+    record["scene"] = scene
+    record["frame_id"] = frame_id
     record["json_path"] = json_path
     record.update(flags)
     record["primary_label"] = primary_label
@@ -291,6 +340,15 @@ def group_by_platform(records):
     return dict(sorted(grouped.items(), key=lambda item: item[0].lower()))
 
 
+def group_by_platform_scene(records):
+    grouped = defaultdict(list)
+    for record in records:
+        platform = str(record.get("platform") or "unknown")
+        scene = str(record.get("scene") or "")
+        grouped[(platform, scene)].append(record)
+    return dict(sorted(grouped.items(), key=lambda item: (item[0][0].lower(), item[0][1].lower())))
+
+
 def mean(records, field):
     return sum(float(record[field]) for record in records) / len(records)
 
@@ -322,6 +380,31 @@ def build_platform_summary(records):
     return summary_rows
 
 
+def build_scene_summary(records):
+    summary_rows = []
+    for (platform, scene), scene_records in group_by_platform_scene(records).items():
+        total = len(scene_records)
+        row = {
+            "platform": platform,
+            "scene": scene,
+            "num_records": total,
+            "mean_top1_iou": mean(scene_records, "top1_iou"),
+            "mean_max_top5_iou": mean(scene_records, "max_top5_iou"),
+            "mean_max_top10_iou": mean(scene_records, "max_top10_iou"),
+            "acc25_top1": sum(metric_value(record, "acc25_top1") for record in scene_records) / total,
+            "acc50_top1": sum(metric_value(record, "acc50_top1") for record in scene_records) / total,
+            "acc25_top10": sum(metric_value(record, "acc25_top10") for record in scene_records) / total,
+            "acc50_top10": sum(metric_value(record, "acc50_top10") for record in scene_records) / total,
+        }
+        for flag in FLAG_COLUMNS:
+            clean_name = clean_flag_name(flag)
+            count = sum(bool_to_int(record[flag]) for record in scene_records)
+            row[f"{clean_name}_count"] = count
+            row[f"{clean_name}_ratio"] = ratio(count, total)
+        summary_rows.append(row)
+    return summary_rows
+
+
 def write_summary_by_platform(records, out_path):
     summary_rows = build_platform_summary(records)
     columns = (
@@ -343,6 +426,32 @@ def write_summary_by_platform(records, out_path):
         writer.writeheader()
         for row in summary_rows:
             writer.writerow(row)
+    return summary_rows
+
+
+def write_scene_summary(records, out_path):
+    summary_rows = build_scene_summary(records)
+    columns = (
+        "platform",
+        "scene",
+        "num_records",
+        "mean_top1_iou",
+        "mean_max_top5_iou",
+        "mean_max_top10_iou",
+        "acc25_top1",
+        "acc50_top1",
+        "acc25_top10",
+        "acc50_top10",
+    )
+    flag_columns = []
+    for flag in FLAG_COLUMNS:
+        clean_name = clean_flag_name(flag)
+        flag_columns.extend((f"{clean_name}_count", f"{clean_name}_ratio"))
+
+    with Path(out_path).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns + tuple(flag_columns))
+        writer.writeheader()
+        writer.writerows(summary_rows)
     return summary_rows
 
 
@@ -380,6 +489,40 @@ def sanitize_filename_part(value):
     return value.strip("_") or "unknown"
 
 
+def stable_sample(records, limit, seed, seed_parts):
+    if limit < 0:
+        raise ValueError("sample limit must be non-negative")
+    records = sorted(records, key=lambda record: (str(record.get("id", "")), record["json_path"]))
+    if len(records) <= limit:
+        return records
+
+    seed_text = "|".join([str(seed)] + [str(part) for part in seed_parts])
+    seed_value = int(hashlib.sha256(seed_text.encode("utf-8")).hexdigest()[:16], 16)
+    sampled = random.Random(seed_value).sample(records, limit)
+    return sorted(sampled, key=lambda record: (str(record.get("id", "")), record["json_path"]))
+
+
+def scene_balanced_sample(records, platform, primary_label, samples_per_scene, seed):
+    platform_key = str(platform).lower()
+    scene_groups = defaultdict(list)
+    for record in records:
+        if str(record.get("platform") or "").lower() != platform_key:
+            continue
+        if record["primary_label"] != primary_label:
+            continue
+        scene_groups[str(record.get("scene") or "")].append(record)
+
+    sampled_records = []
+    for scene in sorted(scene_groups):
+        sampled_records.extend(
+            stable_sample(scene_groups[scene], samples_per_scene, seed, (platform_key, scene, primary_label))
+        )
+    return sorted(
+        sampled_records,
+        key=lambda record: (str(record.get("scene", "")), str(record.get("id", "")), record["json_path"]),
+    )
+
+
 def write_samples(records, samples_dir, samples_per_group, seed):
     if samples_per_group < 0:
         raise ValueError("--samples_per_group must be non-negative")
@@ -403,7 +546,47 @@ def write_samples(records, samples_dir, samples_per_group, seed):
             write_csv(sampled, samples_dir / filename, SAMPLE_COLUMNS)
 
 
-def write_summary_txt(summary_rows, out_path, drone_root, quad_root, out_dir):
+def write_scene_balanced_samples(records, samples_dir, samples_per_scene, seed):
+    if samples_per_scene < 0:
+        raise ValueError("--samples_per_scene must be non-negative")
+
+    samples_dir = Path(samples_dir)
+    samples_dir.mkdir(parents=True, exist_ok=True)
+
+    for platform in group_by_platform(records):
+        for primary_label in PRIMARY_LABELS:
+            sampled = scene_balanced_sample(records, platform, primary_label, samples_per_scene, seed)
+            filename = f"{sanitize_filename_part(platform)}_{primary_label}_scene_balanced.csv"
+            write_csv(sampled, samples_dir / filename, SAMPLE_COLUMNS)
+
+
+def write_manual_review_template(records, out_path, samples_per_scene, seed):
+    if samples_per_scene < 0:
+        raise ValueError("--samples_per_scene must be non-negative")
+
+    review_groups = (
+        ("drone", "A_recall_fail_25"),
+        ("drone", "C_coarse_success_precise_fail"),
+        ("drone", "D_ranking_fail_50"),
+        ("quad", "E_strict_success"),
+    )
+
+    sampled = []
+    for platform, primary_label in review_groups:
+        sampled.extend(scene_balanced_sample(records, platform, primary_label, samples_per_scene, seed))
+    sampled = sorted(
+        sampled,
+        key=lambda record: (
+            str(record.get("platform", "")),
+            record["primary_label"],
+            str(record.get("scene", "")),
+            str(record.get("id", "")),
+        ),
+    )
+    write_csv(sampled, out_path, MANUAL_REVIEW_COLUMNS)
+
+
+def write_summary_txt(summary_rows, scene_summary_rows, out_path, drone_root, quad_root, out_dir):
     lines = [
         "Diagnostic baseline20 DQ summary",
         f"drone_root: {display_path(drone_root)}",
@@ -411,6 +594,10 @@ def write_summary_txt(summary_rows, out_path, drone_root, quad_root, out_dir):
         f"out_dir: {display_path(out_dir)}",
         "",
     ]
+
+    scenes_by_platform = defaultdict(list)
+    for scene_row in scene_summary_rows:
+        scenes_by_platform[scene_row["platform"]].append(scene_row)
 
     for row in summary_rows:
         lines.extend(
@@ -430,6 +617,22 @@ def write_summary_txt(summary_rows, out_path, drone_root, quad_root, out_dir):
         for flag in FLAG_COLUMNS:
             clean_name = clean_flag_name(flag)
             lines.append(f"  {clean_name}: count={row[f'{flag}_count']} ratio={row[f'{flag}_ratio']:.4f}")
+        lines.append("scene_summary:")
+        for scene_row in scenes_by_platform.get(row["platform"], []):
+            scene_name = scene_row["scene"] or "<missing_scene>"
+            lines.extend(
+                [
+                    f"  {scene_name}:",
+                    f"    num_records: {scene_row['num_records']}",
+                    f"    acc25_top1: {scene_row['acc25_top1']:.4f}",
+                    f"    acc50_top1: {scene_row['acc50_top1']:.4f}",
+                    f"    acc25_top10: {scene_row['acc25_top10']:.4f}",
+                    f"    acc50_top10: {scene_row['acc50_top10']:.4f}",
+                    f"    A_recall_fail_25_ratio: {scene_row['A_recall_fail_25_ratio']:.4f}",
+                    f"    C_coarse_success_precise_fail_ratio: {scene_row['C_coarse_success_precise_fail_ratio']:.4f}",
+                    f"    E_strict_success_ratio: {scene_row['E_strict_success_ratio']:.4f}",
+                ]
+            )
         lines.append("")
 
     Path(out_path).write_text("\n".join(lines), encoding="utf-8")
@@ -450,9 +653,12 @@ def main():
     write_jsonl(records, out_dir / "all_records.jsonl")
     write_csv(records, out_dir / "all_records.csv", CSV_COLUMNS)
     summary_rows = write_summary_by_platform(records, out_dir / "summary_by_platform.csv")
+    scene_summary_rows = write_scene_summary(records, out_dir / "scene_summary.csv")
     write_diagnostic_counts(records, out_dir / "diagnostic_counts.csv")
     write_samples(records, out_dir / "samples", args.samples_per_group, args.seed)
-    write_summary_txt(summary_rows, out_dir / "summary.txt", args.drone_root, args.quad_root, out_dir)
+    write_scene_balanced_samples(records, out_dir / "samples_scene_balanced", args.samples_per_scene, args.seed)
+    write_manual_review_template(records, out_dir / "manual_review_template.csv", args.samples_per_scene, args.seed)
+    write_summary_txt(summary_rows, scene_summary_rows, out_dir / "summary.txt", args.drone_root, args.quad_root, out_dir)
 
     print(f"Loaded {len(drone_records)} records from {len(drone_paths)} Drone prediction.json files.")
     print(f"Loaded {len(quad_records)} records from {len(quad_paths)} Quad prediction.json files.")
