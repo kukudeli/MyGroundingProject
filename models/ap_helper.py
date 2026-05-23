@@ -84,13 +84,19 @@ def parse_predictions(end_points, config_dict, prefix="", size_cls_agnostic=Fals
             where pred_list_i = [(pred_sem_cls, box_params, box_score)_j]
             where j = 0, ..., num of valid detections - 1 from sample input i
     """
-    pred_center = end_points[f'{prefix}center']  # B,num_proposal,3
+    use_refined_boxes = bool(end_points.get("box_refine_use_at_eval", False)) and f'{prefix}refined_boxes' in end_points
+    if use_refined_boxes:
+        pred_center = end_points[f'{prefix}refined_boxes'][..., :3]
+    else:
+        pred_center = end_points[f'{prefix}center']  # B,num_proposal,3
     # pred_heading_class = torch.argmax(end_points[f'{prefix}heading_scores'], -1)  # B,num_proposal
     # pred_heading_residual = torch.gather(end_points[f'{prefix}heading_residuals'], 2,
     #                                      pred_heading_class.unsqueeze(-1))  # B,num_proposal,1
     # pred_heading_residual.squeeze_(2)
 
-    if size_cls_agnostic:
+    if use_refined_boxes:
+        pred_size = end_points[f'{prefix}refined_boxes'][..., 3:]
+    elif size_cls_agnostic:
         pred_size = end_points[f'{prefix}pred_size']  # B, num_proposal, 3
     else:
         pred_size_class = torch.argmax(end_points[f'{prefix}size_scores'], -1)  # B,num_proposal

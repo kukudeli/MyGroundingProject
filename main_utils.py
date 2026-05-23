@@ -75,6 +75,15 @@ def parse_option():
     parser.add_argument("--difficulty_loss_max_weight", type=float, default=2.0)
     parser.add_argument("--difficulty_loss_warmup_epoch", type=int, default=5)
     parser.add_argument("--difficulty_loss_apply_to", type=str, default="bbox_giou", choices=["bbox_giou"])
+    parser.add_argument("--difficulty_loss_mode", type=str, default="platform", choices=["platform", "mid_iou"])
+    parser.add_argument("--difficulty_iou_low", type=float, default=0.25)
+    parser.add_argument("--difficulty_iou_high", type=float, default=0.5)
+    parser.add_argument("--difficulty_mid_iou_weight", type=float, default=0.3)
+    parser.add_argument("--use_box_refine_head", action="store_true")
+    parser.add_argument("--box_refine_loss_weight", type=float, default=1.0)
+    parser.add_argument("--box_refine_delta_scale", type=float, default=0.1)
+    parser.add_argument("--box_refine_use_at_eval", action="store_true")
+    parser.add_argument("--box_refine_detach_base_box", action="store_true")
     parser.add_argument("--enable_platform_probe", action="store_true", help="Enable per-platform train-loss diagnostics.")
     parser.add_argument("--platform_probe_freq", type=int, default=100, help="Run platform probe every N train batches.")
     parser.add_argument("--platform_probe_warmup", type=int, default=1, help="Start platform probe from this epoch.")
@@ -180,7 +189,7 @@ def load_checkpoint(args, model, optimizer, scheduler, set_criterion=None):
     """Load from checkpoint."""
     print("=> loading checkpoint '{}'".format(args.checkpoint_path))
 
-    checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(args.checkpoint_path, map_location="cpu", weights_only=False)
     try:
         args.start_epoch = int(checkpoint["epoch"]) + 1
     except Exception:
@@ -258,6 +267,11 @@ class BaseTrainTester:
         "platform_batch_score_",
         "platform_batch_valid_",
     )
+    BOX_REFINE_STAT_KEYS = {
+        "box_refine_active",
+        "box_refine_delta_mean",
+        "box_refine_delta_max",
+    }
 
     @classmethod
     def _is_proto_stat(cls, key):
@@ -265,7 +279,13 @@ class BaseTrainTester:
 
     @classmethod
     def _is_logged_stat(cls, key):
-        return "loss" in key or "acc" in key or "ratio" in key or cls._is_proto_stat(key)
+        return (
+            "loss" in key
+            or "acc" in key
+            or "ratio" in key
+            or key in cls.BOX_REFINE_STAT_KEYS
+            or cls._is_proto_stat(key)
+        )
 
     def __init__(self, args):
         """Initialize."""
@@ -441,6 +461,12 @@ class BaseTrainTester:
             difficulty_loss_max_weight=args.difficulty_loss_max_weight,
             difficulty_loss_warmup_epoch=args.difficulty_loss_warmup_epoch,
             difficulty_loss_apply_to=args.difficulty_loss_apply_to,
+            difficulty_loss_mode=args.difficulty_loss_mode,
+            difficulty_iou_low=args.difficulty_iou_low,
+            difficulty_iou_high=args.difficulty_iou_high,
+            difficulty_mid_iou_weight=args.difficulty_mid_iou_weight,
+            use_box_refine_head=args.use_box_refine_head,
+            box_refine_loss_weight=args.box_refine_loss_weight,
         )
         criterion = compute_hungarian_loss
 
@@ -654,6 +680,8 @@ class BaseTrainTester:
 
         # Forward pass
         end_points = model(inputs)
+        end_points["use_box_refine_head"] = bool(args.use_box_refine_head)
+        end_points["box_refine_use_at_eval"] = bool(args.use_box_refine_head and args.box_refine_use_at_eval)
 
         # Compute loss
         for key in batch_data:

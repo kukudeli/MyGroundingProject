@@ -109,6 +109,30 @@ class GroundingEvaluator:
         self.evaluate_bbox_by_span(batch_data, end_points, prefix)
         self.evaluate_bbox_by_contrast(batch_data, end_points, prefix)
 
+    @staticmethod
+    def _as_bool(value):
+        if torch.is_tensor(value):
+            return bool(value.detach().cpu().item())
+        return bool(value)
+
+    def _uses_refined_boxes(self, end_points, prefix):
+        return (
+            self._as_bool(end_points.get("box_refine_use_at_eval", False))
+            and f"{prefix}refined_boxes" in end_points
+        )
+
+    def _get_pred_bbox(self, end_points, prefix):
+        if self._uses_refined_boxes(end_points, prefix):
+            return end_points[f"{prefix}refined_boxes"]
+        pred_center = end_points[f"{prefix}center"]
+        pred_size = end_points[f"{prefix}pred_size"]
+        return torch.cat([pred_center, pred_size], dim=-1)
+
+    def _get_refined_bbox(self, end_points, prefix):
+        if f"{prefix}refined_boxes" not in end_points:
+            return None
+        return end_points[f"{prefix}refined_boxes"]
+
     def evaluate_bbox_by_span(self, batch_data, end_points, prefix):
         """
         Evaluate bounding box IoU for top gt span detections.
@@ -132,10 +156,8 @@ class GroundingEvaluator:
             sem_scores = sem_scores_
 
         # Parse predictions
-        pred_center = end_points[f"{prefix}center"]  # B, Q, 3
-        pred_size = end_points[f"{prefix}pred_size"]  # (B,Q,3) (l,w,h)
-        assert (pred_size < 0).sum() == 0
-        pred_bbox = torch.cat([pred_center, pred_size], dim=-1)  # B, Q=256, 6, each query corresponds to a box
+        pred_bbox = self._get_pred_bbox(end_points, prefix)  # B, Q=256, 6, each query corresponds to a box
+        assert (pred_bbox[..., 3:] < 0).sum() == 0
 
         # Highest scoring box -> iou
         for bid in range(len(positive_map)):
@@ -192,10 +214,9 @@ class GroundingEvaluator:
         # gt_bboxes_rotated: (B=8, 132, 7/9) - GT bbox with rotation; first num_obj are valid
         
         # ============ 2. Parse model predictions ============
-        pred_center = end_points[f"{prefix}center"]  # (B=8, Q=256, 3) - predicted centers
-        pred_size = end_points[f"{prefix}pred_size"]  # (B=8, Q=256, 3) - predicted sizes (l,w,h)
-        assert (pred_size < 0).sum() == 0  # ensure sizes are positive
-        pred_bbox = torch.cat([pred_center, pred_size], dim=-1)  # (B=8, Q=256, 6)
+        pred_bbox = self._get_pred_bbox(end_points, prefix)  # (B=8, Q=256, 6)
+        refined_pred_bbox = self._get_refined_bbox(end_points, prefix)
+        assert (pred_bbox[..., 3:] < 0).sum() == 0  # ensure sizes are positive
         # DETR: each sample predicts 256 candidate boxes (queries)
 
         # ============ 3. Compute contrastive scores ============
@@ -245,6 +266,9 @@ class GroundingEvaluator:
             # [:, :10]: take top 10 indices
             
             pbox = pred_bbox[bid, top.reshape(-1)]  # (10, 6) - [cx,cy,cz,w,h,d] axis-aligned
+            refined_pbox = None
+            if refined_pred_bbox is not None:
+                refined_pbox = refined_pred_bbox[bid, top.reshape(-1)]
             # Pick these 10 best-matching predicted boxes from 256 candidates
 
             # 4.4 Compute IoU
@@ -284,7 +308,12 @@ class GroundingEvaluator:
                     "acc50_top1": int((ious[0, 0] > 0.5).detach().cpu().item()),
                     "acc25_top10": int((ious[0, :10].max() > 0.25).detach().cpu().item()),
                     "acc50_top10": int((ious[0, :10].max() > 0.5).detach().cpu().item()),
+                    "use_box_refine_head": self._as_bool(end_points.get("use_box_refine_head", False)),
+                    "box_refine_use_at_eval": self._as_bool(end_points.get("box_refine_use_at_eval", False)),
                 }
+                if refined_pbox is not None:
+                    record["top1_refined_box"] = refined_pbox[0].detach().cpu().numpy().tolist()
+                    record["top10_refined_pred_boxes"] = refined_pbox.detach().cpu().numpy().tolist()
                 self.prediction_records.append(record)
 
             # Accumulate mean IoU (for mIoU)
