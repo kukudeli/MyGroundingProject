@@ -365,6 +365,11 @@ class SetCriterion(nn.Module):
         proto_min_platform_seen=5,
         proto_weak_pce_boost=1.0,
         proto_max_pce_boost=2.0,
+        use_difficulty_loss_weight=False,
+        difficulty_loss_weight=0.5,
+        difficulty_loss_max_weight=2.0,
+        difficulty_loss_warmup_epoch=5,
+        difficulty_loss_apply_to="bbox_giou",
     ):
         """
         Parameters:
@@ -381,6 +386,20 @@ class SetCriterion(nn.Module):
         self.use_platform_proto = use_platform_proto
         self.proto_feature_mode = proto_feature_mode
         self.proto_status_mode = proto_status_mode
+        self.num_platforms = num_platforms
+        self.proto_score_momentum = proto_score_momentum
+        self.proto_min_platform_samples = proto_min_platform_samples
+        self.proto_min_platform_seen = proto_min_platform_seen
+        self.use_difficulty_loss_weight = use_difficulty_loss_weight
+        self.difficulty_loss_weight = difficulty_loss_weight
+        self.difficulty_loss_max_weight = difficulty_loss_max_weight
+        self.difficulty_loss_warmup_epoch = difficulty_loss_warmup_epoch
+        self.difficulty_loss_apply_to = difficulty_loss_apply_to
+        if self.difficulty_loss_apply_to != "bbox_giou":
+            raise ValueError(f"Unknown difficulty_loss_apply_to: {self.difficulty_loss_apply_to}")
+        self.register_buffer("difficulty_platform_score_ema", torch.zeros(num_platforms))
+        self.register_buffer("difficulty_platform_score_initialized", torch.zeros(num_platforms, dtype=torch.bool))
+        self.register_buffer("difficulty_platform_seen_count", torch.zeros(num_platforms))
         if self.use_platform_proto:
             self.platform_proto_loss = PlatformPrototypeRebalanceLoss(
                 in_dim=proto_in_dim,
@@ -440,7 +459,7 @@ class SetCriterion(nn.Module):
 
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes):
+    def loss_boxes(self, outputs, targets, indices, num_boxes, difficulty_sample_weights=None):
         """Compute bbox losses."""
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
@@ -460,12 +479,30 @@ class SetCriterion(nn.Module):
             )
         )
         losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
         loss_giou = 1 - torch.diag(generalized_box_iou3d(
             box_cxcyczwhd_to_xyzxyz(src_boxes),
             box_cxcyczwhd_to_xyzxyz(target_boxes)))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        if difficulty_sample_weights is None:
+            losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+            losses['loss_giou'] = loss_giou.sum() / num_boxes
+            return losses
+
+        match_weights = difficulty_sample_weights.to(
+            device=src_boxes.device,
+            dtype=src_boxes.dtype,
+        )[idx[0]]
+        loss_bbox_per_match = loss_bbox.sum(dim=-1)
+        losses['loss_bbox'] = (loss_bbox_per_match * match_weights).sum() / num_boxes
+        losses['loss_giou'] = (loss_giou * match_weights).sum() / num_boxes
+
+        extra_weights = (match_weights - 1.0).clamp_min(0.0)
+        losses['difficulty_loss_bbox_contrib'] = (
+            loss_bbox_per_match * extra_weights
+        ).sum() / num_boxes
+        losses['difficulty_loss_giou_contrib'] = (
+            loss_giou * extra_weights
+        ).sum() / num_boxes
         return losses
 
     def loss_contrastive_align(self, outputs, targets, indices, num_boxes):
@@ -555,6 +592,129 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
+    def _difficulty_loss_stats(
+        self,
+        device,
+        active=False,
+        mean_weight=1.0,
+        max_weight=1.0,
+        num_weighted_samples=0,
+        weighted_platform=-1,
+        platform_gap=None,
+    ):
+        if platform_gap is None:
+            platform_gap = torch.zeros((), device=device)
+        elif not torch.is_tensor(platform_gap):
+            platform_gap = torch.tensor(float(platform_gap), device=device)
+        return {
+            "difficulty_loss_active": torch.tensor(float(active), device=device),
+            "difficulty_loss_mean_weight": torch.tensor(float(mean_weight), device=device),
+            "difficulty_loss_max_weight": torch.tensor(float(max_weight), device=device),
+            "difficulty_loss_num_weighted_samples": torch.tensor(float(num_weighted_samples), device=device),
+            "difficulty_loss_weighted_platform": torch.tensor(float(weighted_platform), device=device),
+            "difficulty_loss_platform_gap": platform_gap.detach().to(device),
+        }
+
+    @torch.no_grad()
+    def _update_difficulty_platform_status(self, status_values, platform_labels):
+        device = status_values.device
+        status_values = status_values.detach()
+        platform_labels = platform_labels.to(device=device, dtype=torch.long)
+        for platform in platform_labels.unique():
+            platform_idx = int(platform.item())
+            if platform_idx < 0 or platform_idx >= self.num_platforms:
+                continue
+            mask = platform_labels == platform_idx
+            num_samples = int(mask.sum().item())
+            if num_samples < self.proto_min_platform_samples:
+                continue
+            batch_score = status_values[mask].mean()
+            if self.difficulty_platform_score_initialized[platform_idx]:
+                old_score = self.difficulty_platform_score_ema[platform_idx]
+                self.difficulty_platform_score_ema[platform_idx] = (
+                    self.proto_score_momentum * old_score
+                    + (1.0 - self.proto_score_momentum) * batch_score
+                )
+            else:
+                self.difficulty_platform_score_ema[platform_idx] = batch_score
+                self.difficulty_platform_score_initialized[platform_idx] = True
+            self.difficulty_platform_seen_count[platform_idx] += float(num_samples)
+
+    def _select_difficulty_weak_platform(self):
+        ready_mask = (
+            self.difficulty_platform_score_initialized
+            & (self.difficulty_platform_seen_count >= float(self.proto_min_platform_seen))
+        )
+        if int(ready_mask.sum().item()) < 2:
+            return -1, self.difficulty_platform_score_ema.sum() * 0.0, False
+
+        ready_indices = torch.nonzero(ready_mask, as_tuple=False).squeeze(1)
+        ready_scores = self.difficulty_platform_score_ema[ready_indices]
+        weak_pos = torch.argmax(ready_scores)
+        strong_pos = torch.argmin(ready_scores)
+        weak_score = ready_scores[weak_pos]
+        strong_score = ready_scores[strong_pos]
+        platform_gap = (weak_score - strong_score) / (0.5 * (weak_score + strong_score) + 1e-6)
+        weak_platform = int(ready_indices[weak_pos].item())
+        return weak_platform, platform_gap, True
+
+    def get_difficulty_loss_sample_weights(self, platform_labels, epoch=None, device=None):
+        if platform_labels is None:
+            if device is None:
+                device = self.difficulty_platform_score_ema.device
+            return None, self._difficulty_loss_stats(device)
+
+        device = platform_labels.device
+        current_epoch = -1 if epoch is None else int(epoch)
+        if (
+            not self.use_difficulty_loss_weight
+            or not self.training
+            or current_epoch < self.difficulty_loss_warmup_epoch
+        ):
+            return None, self._difficulty_loss_stats(device)
+
+        weak_platform, platform_gap, status_ready = self._select_difficulty_weak_platform()
+        stats = self._difficulty_loss_stats(
+            device,
+            weighted_platform=weak_platform,
+            platform_gap=platform_gap,
+        )
+        if not status_ready or weak_platform < 0:
+            return None, stats
+
+        max_weight = max(float(self.difficulty_loss_max_weight), 1.0)
+        weak_weight = min(1.0 + max(float(self.difficulty_loss_weight), 0.0), max_weight)
+        if weak_weight <= 1.0:
+            return None, stats
+
+        sample_weights = torch.ones(platform_labels.shape, dtype=torch.float32, device=device)
+        weak_mask = platform_labels.to(device=device, dtype=torch.long) == weak_platform
+        if not weak_mask.any():
+            return None, stats
+
+        sample_weights[weak_mask] = weak_weight
+        return sample_weights, self._difficulty_loss_stats(
+            device,
+            active=True,
+            mean_weight=float(sample_weights.mean().item()),
+            max_weight=float(sample_weights.max().item()),
+            num_weighted_samples=int(weak_mask.sum().item()),
+            weighted_platform=weak_platform,
+            platform_gap=platform_gap,
+        )
+
+    @torch.no_grad()
+    def update_difficulty_loss_status(self, status_values, platform_labels):
+        if (
+            not self.use_difficulty_loss_weight
+            or not self.training
+            or status_values is None
+            or platform_labels is None
+            or status_values.numel() == 0
+        ):
+            return
+        self._update_difficulty_platform_status(status_values, platform_labels)
+
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'labels': self.loss_labels_st,
@@ -562,9 +722,17 @@ class SetCriterion(nn.Module):
             'contrastive_align': self.loss_contrastive_align
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
-        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+        if loss == 'boxes':
+            return self.loss_boxes(
+                outputs,
+                targets,
+                indices,
+                num_boxes,
+                difficulty_sample_weights=kwargs.get("difficulty_sample_weights"),
+            )
+        return loss_map[loss](outputs, targets, indices, num_boxes)
 
-    def forward(self, outputs, targets):
+    def forward(self, outputs, targets, difficulty_sample_weights=None):
         """
         Perform the loss computation.
 
@@ -588,7 +756,12 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(
-                loss, outputs, targets, indices, num_boxes
+                loss,
+                outputs,
+                targets,
+                indices,
+                num_boxes,
+                difficulty_sample_weights=difficulty_sample_weights,
             ))
 
         return losses, indices
@@ -687,6 +860,17 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
     ]
 
     loss_ce, loss_bbox, loss_giou, loss_contrastive_align = 0, 0, 0, 0
+    zero = gt_center.sum() * 0.0
+    difficulty_loss_bbox_contrib = zero
+    difficulty_loss_giou_contrib = zero
+    difficulty_sample_weights = None
+    difficulty_loss_stats = None
+    if set_criterion.use_difficulty_loss_weight and set_criterion.training:
+        difficulty_sample_weights, difficulty_loss_stats = set_criterion.get_difficulty_loss_sample_weights(
+            end_points.get("platform_label", None),
+            epoch=end_points.get("epoch", None),
+            device=gt_center.device,
+        )
     last_layer_indices = None
     last_layer_pred_boxes = None
     for prefix in prefixes:
@@ -705,7 +889,11 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         output["pred_boxes"] = pred_bbox
 
         # Compute all the requested losses
-        losses, indices = set_criterion(output, target)
+        losses, indices = set_criterion(
+            output,
+            target,
+            difficulty_sample_weights=difficulty_sample_weights,
+        )
         if prefix == "last_":
             last_layer_indices = indices
             last_layer_pred_boxes = pred_bbox
@@ -714,6 +902,8 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         loss_ce += losses.get('loss_ce', 0)
         loss_bbox += losses['loss_bbox']
         loss_giou += losses.get('loss_giou', 0)
+        difficulty_loss_bbox_contrib += losses.get('difficulty_loss_bbox_contrib', zero)
+        difficulty_loss_giou_contrib += losses.get('difficulty_loss_giou_contrib', zero)
         if 'proj_tokens' in end_points:
             loss_contrastive_align += losses['loss_contrastive_align']
 
@@ -739,6 +929,41 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
     end_points['loss_giou'] = loss_giou
     end_points['query_points_generation_loss'] = query_points_generation_loss
     end_points['loss_constrastive_align'] = loss_contrastive_align
+    matched_query_cache = None
+    need_matched_query_cache = (
+        set_criterion.training
+        and "platform_label" in end_points
+        and "proto_query_features" in end_points
+        and (
+            set_criterion.use_difficulty_loss_weight
+            or (
+                set_criterion.use_platform_proto
+                and set_criterion.proto_feature_mode == "matched_query"
+            )
+        )
+    )
+    if need_matched_query_cache:
+        matched_query_cache = extract_matched_query_features_and_box_difficulty(
+            end_points["proto_query_features"],
+            last_layer_pred_boxes,
+            last_layer_indices if last_layer_indices is not None else [],
+            target,
+            end_points["platform_label"].long(),
+        )
+    if difficulty_loss_stats is not None:
+        end_points.update(difficulty_loss_stats)
+        end_points["difficulty_loss_bbox_contrib"] = difficulty_loss_bbox_contrib.detach()
+        end_points["difficulty_loss_giou_contrib"] = difficulty_loss_giou_contrib.detach()
+    if (
+        set_criterion.use_difficulty_loss_weight
+        and set_criterion.training
+        and matched_query_cache is not None
+    ):
+        _, difficulty_platform_labels, _, matched_box_difficulty = matched_query_cache
+        set_criterion.update_difficulty_loss_status(
+            matched_box_difficulty,
+            difficulty_platform_labels,
+        )
     if set_criterion.use_platform_proto and set_criterion.training:
         platform_labels = end_points["platform_label"].long()
         status_values = None
@@ -754,13 +979,15 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
             platform_labels = platform_labels[valid_mask]
             class_labels = class_labels[valid_mask]
         elif set_criterion.proto_feature_mode == "matched_query":
-            proto_features, platform_labels, class_labels, matched_box_difficulty = extract_matched_query_features_and_box_difficulty(
-                end_points["proto_query_features"],
-                last_layer_pred_boxes,
-                last_layer_indices if last_layer_indices is not None else [],
-                target,
-                platform_labels,
-            )
+            if matched_query_cache is None:
+                matched_query_cache = extract_matched_query_features_and_box_difficulty(
+                    end_points["proto_query_features"],
+                    last_layer_pred_boxes,
+                    last_layer_indices if last_layer_indices is not None else [],
+                    target,
+                    platform_labels,
+                )
+            proto_features, platform_labels, class_labels, matched_box_difficulty = matched_query_cache
             if set_criterion.proto_status_mode == "box_difficulty":
                 status_values = matched_box_difficulty
             elif set_criterion.proto_status_mode == "proto_confidence":

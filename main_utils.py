@@ -70,6 +70,11 @@ def parse_option():
     parser.add_argument("--proto_min_platform_seen", type=int, default=5)
     parser.add_argument("--proto_weak_pce_boost", type=float, default=1.0)
     parser.add_argument("--proto_max_pce_boost", type=float, default=2.0)
+    parser.add_argument("--use_difficulty_loss_weight", action="store_true")
+    parser.add_argument("--difficulty_loss_weight", type=float, default=0.5)
+    parser.add_argument("--difficulty_loss_max_weight", type=float, default=2.0)
+    parser.add_argument("--difficulty_loss_warmup_epoch", type=int, default=5)
+    parser.add_argument("--difficulty_loss_apply_to", type=str, default="bbox_giou", choices=["bbox_giou"])
     parser.add_argument("--enable_platform_probe", action="store_true", help="Enable per-platform train-loss diagnostics.")
     parser.add_argument("--platform_probe_freq", type=int, default=100, help="Run platform probe every N train batches.")
     parser.add_argument("--platform_probe_warmup", type=int, default=1, help="Start platform probe from this epoch.")
@@ -431,6 +436,11 @@ class BaseTrainTester:
             proto_min_platform_seen=args.proto_min_platform_seen,
             proto_weak_pce_boost=args.proto_weak_pce_boost,
             proto_max_pce_boost=args.proto_max_pce_boost,
+            use_difficulty_loss_weight=args.use_difficulty_loss_weight,
+            difficulty_loss_weight=args.difficulty_loss_weight,
+            difficulty_loss_max_weight=args.difficulty_loss_max_weight,
+            difficulty_loss_warmup_epoch=args.difficulty_loss_warmup_epoch,
+            difficulty_loss_apply_to=args.difficulty_loss_apply_to,
         )
         criterion = compute_hungarian_loss
 
