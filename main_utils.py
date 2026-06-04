@@ -84,6 +84,9 @@ def parse_option():
     parser.add_argument("--box_refine_delta_scale", type=float, default=0.1)
     parser.add_argument("--box_refine_use_at_eval", action="store_true")
     parser.add_argument("--box_refine_detach_base_box", action="store_true")
+    parser.add_argument("--use_enclosing_aligned_gt_loss", action="store_true")
+    parser.add_argument("--enclosing_gt_loss_weight", type=float, default=0.5)
+    parser.add_argument("--enclosing_gt_apply_to", type=str, default="refine", choices=["refine"])
     parser.add_argument("--enable_platform_probe", action="store_true", help="Enable per-platform train-loss diagnostics.")
     parser.add_argument("--platform_probe_freq", type=int, default=100, help="Run platform probe every N train batches.")
     parser.add_argument("--platform_probe_warmup", type=int, default=1, help="Start platform probe from this epoch.")
@@ -271,6 +274,12 @@ class BaseTrainTester:
         "box_refine_active",
         "box_refine_delta_mean",
         "box_refine_delta_max",
+        "box_refine_src_size_min",
+        "box_refine_src_size_mean",
+        "box_refine_tgt_size_min",
+        "box_refine_tgt_size_mean",
+        "box_refine_src_center_abs_mean",
+        "box_refine_tgt_center_abs_mean",
     }
 
     @classmethod
@@ -467,6 +476,9 @@ class BaseTrainTester:
             difficulty_mid_iou_weight=args.difficulty_mid_iou_weight,
             use_box_refine_head=args.use_box_refine_head,
             box_refine_loss_weight=args.box_refine_loss_weight,
+            use_enclosing_aligned_gt_loss=args.use_enclosing_aligned_gt_loss,
+            enclosing_gt_loss_weight=args.enclosing_gt_loss_weight,
+            enclosing_gt_apply_to=args.enclosing_gt_apply_to,
         )
         criterion = compute_hungarian_loss
 

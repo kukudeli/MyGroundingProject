@@ -130,6 +130,9 @@ class BeaUTyDETR(nn.Module):
                 nn.ReLU(),
                 nn.Linear(d_model, 6),
             )
+            last_layer = self.box_refine_head[-1]
+            nn.init.zeros_(last_layer.weight)
+            nn.init.zeros_(last_layer.bias)
 
         # Extra layers for contrastive losses
         if contrastive_align_loss:
@@ -281,6 +284,7 @@ class BeaUTyDETR(nn.Module):
                 # Size uses bounded multiplicative correction to stay positive.
                 refined_center = base_xyz + delta[..., :3]
                 refined_size = safe_size * torch.exp(delta[..., 3:])
+                refined_size = refined_size.clamp_min(1e-6)
                 refined_box = torch.cat([refined_center, refined_size], dim=-1)
 
                 end_points[f"{prefix}refined_center"] = refined_center
