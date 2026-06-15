@@ -32,12 +32,19 @@ DIFFICULTY_LOSS_STAT_KEYS = {
 }
 
 BOX_REFINE_LOSS_STAT_KEYS = {
+    "box_refine_use_enclosing_target",
     "box_refine_src_size_min",
     "box_refine_src_size_mean",
     "box_refine_tgt_size_min",
     "box_refine_tgt_size_mean",
+    "box_refine_target_size_min",
+    "box_refine_target_size_mean",
+    "box_refine_src_volume_mean",
+    "box_refine_target_volume_mean",
     "box_refine_src_center_abs_mean",
     "box_refine_tgt_center_abs_mean",
+    "loss_bbox_refine_raw",
+    "loss_giou_refine_raw",
 }
 
 
@@ -467,6 +474,10 @@ class SetCriterion(nn.Module):
         proto_min_platform_seen=5,
         proto_weak_pce_boost=1.0,
         proto_max_pce_boost=2.0,
+        proto_pce_difficulty_aware=False,
+        proto_pce_hard_iou_thr=0.5,
+        proto_pce_easy_iou_thr=0.6,
+        proto_pce_gate_mode="hard",
         use_difficulty_loss_weight=False,
         difficulty_loss_weight=0.5,
         difficulty_loss_max_weight=2.0,
@@ -481,6 +492,7 @@ class SetCriterion(nn.Module):
         use_enclosing_aligned_gt_loss=False,
         enclosing_gt_loss_weight=0.5,
         enclosing_gt_apply_to="refine",
+        use_enclosing_aligned_gt_as_box_target=False,
     ):
         """
         Parameters:
@@ -515,6 +527,7 @@ class SetCriterion(nn.Module):
         self.use_enclosing_aligned_gt_loss = use_enclosing_aligned_gt_loss
         self.enclosing_gt_loss_weight = enclosing_gt_loss_weight
         self.enclosing_gt_apply_to = enclosing_gt_apply_to
+        self.use_enclosing_aligned_gt_as_box_target = use_enclosing_aligned_gt_as_box_target
         if self.enclosing_gt_apply_to not in {"refine"}:
             raise ValueError(f"Unknown enclosing_gt_apply_to: {self.enclosing_gt_apply_to}")
         if float(self.enclosing_gt_loss_weight) < 0.0:
@@ -525,6 +538,8 @@ class SetCriterion(nn.Module):
             raise ValueError(f"Unknown difficulty_loss_mode: {self.difficulty_loss_mode}")
         if float(self.difficulty_iou_high) < float(self.difficulty_iou_low):
             raise ValueError("difficulty_iou_high must be >= difficulty_iou_low")
+        if proto_pce_difficulty_aware and proto_feature_mode != "matched_query":
+            raise ValueError("proto_pce_difficulty_aware requires proto_feature_mode='matched_query'")
         self.register_buffer("difficulty_platform_score_ema", torch.zeros(num_platforms))
         self.register_buffer("difficulty_platform_score_initialized", torch.zeros(num_platforms, dtype=torch.bool))
         self.register_buffer("difficulty_platform_seen_count", torch.zeros(num_platforms))
@@ -548,6 +563,10 @@ class SetCriterion(nn.Module):
                 min_platform_seen=proto_min_platform_seen,
                 weak_pce_boost=proto_weak_pce_boost,
                 max_pce_boost=proto_max_pce_boost,
+                pce_difficulty_aware=proto_pce_difficulty_aware,
+                pce_hard_iou_thr=proto_pce_hard_iou_thr,
+                pce_easy_iou_thr=proto_pce_easy_iou_thr,
+                pce_gate_mode=proto_pce_gate_mode,
             )
 
     def _use_enclosing_refine_target(self):
@@ -715,16 +734,25 @@ class SetCriterion(nn.Module):
                 f"Target box sizes must be positive for refine loss, min={tgt_size.detach().min().item():.6g}"
             )
 
+        src_volume = src_size.prod(dim=-1)
+        tgt_volume = tgt_size.prod(dim=-1)
         debug_stats = {
+            "box_refine_use_enclosing_target": torch.tensor(
+                float(self._use_enclosing_refine_target()), device=src_boxes.device
+            ),
             "box_refine_src_size_min": src_size.detach().min(),
             "box_refine_src_size_mean": src_size.detach().mean(),
             "box_refine_tgt_size_min": tgt_size.detach().min(),
             "box_refine_tgt_size_mean": tgt_size.detach().mean(),
+            "box_refine_target_size_min": tgt_size.detach().min(),
+            "box_refine_target_size_mean": tgt_size.detach().mean(),
+            "box_refine_src_volume_mean": src_volume.detach().mean(),
+            "box_refine_target_volume_mean": tgt_volume.detach().mean(),
             "box_refine_src_center_abs_mean": src_boxes[..., :3].detach().abs().mean(),
             "box_refine_tgt_center_abs_mean": target_boxes[..., :3].detach().abs().mean(),
         }
 
-        loss_bbox = (
+        loss_bbox_refine_per_dim = (
             F.l1_loss(
                 src_boxes[..., :3], target_boxes[..., :3],
                 reduction='none'
@@ -734,21 +762,33 @@ class SetCriterion(nn.Module):
                 reduction='none'
             )
         )
+        if not torch.isfinite(loss_bbox_refine_per_dim).all():
+            raise FloatingPointError("Non-finite L1 refine bbox loss values found.")
+
         src_xyzxyz = box_cxcyczwhd_to_xyzxyz(src_boxes)
         tgt_xyzxyz = box_cxcyczwhd_to_xyzxyz(target_boxes)
-        loss_giou_refine_vec = 1 - torch.diag(generalized_box_iou3d(src_xyzxyz, tgt_xyzxyz))
-        if not torch.isfinite(loss_giou_refine_vec).all():
+        loss_giou_refine_per_box = 1 - torch.diag(generalized_box_iou3d(src_xyzxyz, tgt_xyzxyz))
+        if not torch.isfinite(loss_giou_refine_per_box).all():
             raise FloatingPointError("Non-finite GIoU refine loss values found.")
-        if (loss_giou_refine_vec.abs() > 100).any():
+        if (loss_giou_refine_per_box.abs() > 100).any():
             raise FloatingPointError(
                 "Unusually large GIoU refine loss found: "
-                f"max_abs={loss_giou_refine_vec.detach().abs().max().item():.6g}. "
+                f"max_abs={loss_giou_refine_per_box.detach().abs().max().item():.6g}. "
                 "Check refined box scale and format."
             )
 
+        loss_bbox_refine_raw = loss_bbox_refine_per_dim.sum() / num_boxes
+        loss_giou_refine_raw = loss_giou_refine_per_box.sum() / num_boxes
+        if not torch.isfinite(loss_bbox_refine_raw):
+            raise FloatingPointError("Non-finite reduced L1 refine bbox loss found.")
+        if not torch.isfinite(loss_giou_refine_raw):
+            raise FloatingPointError("Non-finite reduced GIoU refine loss found.")
+
         losses = {
-            "loss_bbox_refine": loss_bbox.sum() / num_boxes,
-            "loss_giou_refine": loss_giou_refine_vec.sum() / num_boxes,
+            "loss_bbox_refine": loss_bbox_refine_raw,
+            "loss_giou_refine": loss_giou_refine_raw,
+            "loss_bbox_refine_raw": loss_bbox_refine_raw.detach(),
+            "loss_giou_refine_raw": loss_giou_refine_raw.detach(),
             "box_refine_active": torch.ones((), device=src_boxes.device),
         }
         losses.update(debug_stats)
@@ -1105,6 +1145,7 @@ def extract_matched_query_features_and_box_difficulty(
     matched_platform_labels = []
     matched_class_labels = []
     matched_box_difficulty = []
+    matched_ious = []
 
     if last_pred_boxes is None:
         indices = []
@@ -1134,16 +1175,17 @@ def extract_matched_query_features_and_box_difficulty(
                     reduction="none",
                 ).sum(dim=-1)
             )
-            giou_each = 1 - torch.diag(generalized_box_iou3d(
-                box_cxcyczwhd_to_xyzxyz(pred_boxes),
-                box_cxcyczwhd_to_xyzxyz(gt_boxes),
-            ))
+            pred_xyzxyz = box_cxcyczwhd_to_xyzxyz(pred_boxes)
+            gt_xyzxyz = box_cxcyczwhd_to_xyzxyz(gt_boxes)
+            matched_iou = _aligned_iou3d(pred_xyzxyz, gt_xyzxyz).detach()
+            giou_each = 1 - torch.diag(generalized_box_iou3d(pred_xyzxyz, gt_xyzxyz))
             difficulty = (bbox_l1 + giou_each).detach()
 
         matched_features.append(features)
         matched_platform_labels.append(platforms)
         matched_class_labels.append(labels)
         matched_box_difficulty.append(difficulty)
+        matched_ious.append(matched_iou)
 
     if len(matched_features) == 0:
         feature_dim = proto_query_features.shape[-1]
@@ -1152,6 +1194,7 @@ def extract_matched_query_features_and_box_difficulty(
             platform_labels.new_zeros((0,), dtype=torch.long).to(device),
             platform_labels.new_zeros((0,), dtype=torch.long).to(device),
             proto_query_features.new_zeros((0,)),
+            proto_query_features.new_zeros((0,)),
         )
 
     return (
@@ -1159,6 +1202,7 @@ def extract_matched_query_features_and_box_difficulty(
         torch.cat(matched_platform_labels, dim=0),
         torch.cat(matched_class_labels, dim=0),
         torch.cat(matched_box_difficulty, dim=0),
+        torch.cat(matched_ious, dim=0),
     )
 
 
@@ -1172,17 +1216,56 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
     gt_center = end_points['center_label'][:, :, 0:3]  # B, G, 3
     gt_size = end_points['size_gts']  # (B,G,3)
     gt_labels = end_points['sem_cls_label']  # (B, G)
-    gt_bbox = torch.cat([gt_center, gt_size], dim=-1)  # cxcyczwhd
+    zero = gt_center.sum() * 0.0
+    original_gt_bbox = torch.cat([gt_center, gt_size], dim=-1)  # cxcyczwhd
+    gt_bbox = original_gt_bbox
     gt_bbox_enclosing_aligned = None
-    if set_criterion.use_enclosing_aligned_gt_loss:
+    need_enclosing_aligned_gt = (
+        set_criterion.use_enclosing_aligned_gt_loss
+        or set_criterion.use_enclosing_aligned_gt_as_box_target
+    )
+    if need_enclosing_aligned_gt:
         if 'gt_bboxes' not in end_points:
-            raise KeyError(
-                "use_enclosing_aligned_gt_loss requires end_points['gt_bboxes'] with 7D rotated GT boxes"
+            raise ValueError(
+                "enclosing aligned GT target requires end_points['gt_bboxes'] with 7D rotated GT boxes"
             )
         gt_bboxes_rotated = end_points['gt_bboxes'].to(device=gt_center.device, dtype=gt_center.dtype)
+        if gt_bboxes_rotated.shape[-1] < 7:
+            raise ValueError(
+                f"end_points['gt_bboxes'] must have at least 7 dims, got {tuple(gt_bboxes_rotated.shape)}"
+            )
         gt_bbox_enclosing_aligned = rotated_gt_to_enclosing_aligned_box_torch(gt_bboxes_rotated)
+        if set_criterion.use_enclosing_aligned_gt_as_box_target:
+            gt_bbox = gt_bbox_enclosing_aligned
     positive_map = end_points['positive_map']
     box_label_mask = end_points['box_label_mask']
+    valid_gt_mask = box_label_mask.bool()
+    if valid_gt_mask.any():
+        original_valid_size = original_gt_bbox[..., 3:][valid_gt_mask].clamp_min(1e-6)
+        target_valid_size = gt_bbox[..., 3:][valid_gt_mask].clamp_min(1e-6)
+        original_valid_volume = original_valid_size.prod(dim=-1)
+        target_valid_volume = target_valid_size.prod(dim=-1)
+        end_points['enclosing_box_target_active'] = torch.tensor(
+            float(set_criterion.use_enclosing_aligned_gt_as_box_target), device=gt_center.device
+        )
+        end_points['enclosing_box_target_size_mean'] = target_valid_size.detach().mean()
+        end_points['enclosing_box_target_size_min'] = target_valid_size.detach().min()
+        end_points['enclosing_box_target_volume_mean'] = target_valid_volume.detach().mean()
+        end_points['original_gt_size_mean'] = original_valid_size.detach().mean()
+        end_points['original_gt_volume_mean'] = original_valid_volume.detach().mean()
+        end_points['enclosing_to_original_volume_ratio_mean'] = (
+            target_valid_volume / original_valid_volume.clamp_min(1e-6)
+        ).detach().mean()
+    else:
+        end_points['enclosing_box_target_active'] = torch.tensor(
+            float(set_criterion.use_enclosing_aligned_gt_as_box_target), device=gt_center.device
+        )
+        end_points['enclosing_box_target_size_mean'] = zero.detach()
+        end_points['enclosing_box_target_size_min'] = zero.detach()
+        end_points['enclosing_box_target_volume_mean'] = zero.detach()
+        end_points['original_gt_size_mean'] = zero.detach()
+        end_points['original_gt_volume_mean'] = zero.detach()
+        end_points['enclosing_to_original_volume_ratio_mean'] = zero.detach()
     target = []
     for b in range(gt_labels.shape[0]):
         valid_mask = box_label_mask[b].bool()
@@ -1196,7 +1279,6 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         target.append(target_item)
 
     loss_ce, loss_bbox, loss_giou, loss_contrastive_align = 0, 0, 0, 0
-    zero = gt_center.sum() * 0.0
     loss_bbox_refine = zero
     loss_giou_refine = zero
     box_refine_active = zero
@@ -1269,8 +1351,10 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         loss_ce += losses.get('loss_ce', 0)
         loss_bbox += losses['loss_bbox']
         loss_giou += losses.get('loss_giou', 0)
-        loss_bbox_refine += losses.get('loss_bbox_refine', zero)
-        loss_giou_refine += losses.get('loss_giou_refine', zero)
+        current_loss_bbox_refine = losses.get('loss_bbox_refine', zero)
+        current_loss_giou_refine = losses.get('loss_giou_refine', zero)
+        loss_bbox_refine += current_loss_bbox_refine
+        loss_giou_refine += current_loss_giou_refine
         box_refine_active = torch.maximum(
             box_refine_active,
             losses.get('box_refine_active', zero).to(device=box_refine_active.device),
@@ -1353,7 +1437,7 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         and set_criterion.training
         and matched_query_cache is not None
     ):
-        _, difficulty_platform_labels, _, matched_box_difficulty = matched_query_cache
+        _, difficulty_platform_labels, _, matched_box_difficulty, _ = matched_query_cache
         set_criterion.update_difficulty_loss_status(
             matched_box_difficulty,
             difficulty_platform_labels,
@@ -1361,6 +1445,7 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
     if set_criterion.use_platform_proto and set_criterion.training:
         platform_labels = end_points["platform_label"].long()
         status_values = None
+        matched_ious = None
         if set_criterion.proto_feature_mode == "mean_query":
             if set_criterion.proto_status_mode == "box_difficulty":
                 raise ValueError(
@@ -1381,7 +1466,7 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
                     target,
                     platform_labels,
                 )
-            proto_features, platform_labels, class_labels, matched_box_difficulty = matched_query_cache
+            proto_features, platform_labels, class_labels, matched_box_difficulty, matched_ious = matched_query_cache
             if set_criterion.proto_status_mode == "box_difficulty":
                 status_values = matched_box_difficulty
             elif set_criterion.proto_status_mode == "proto_confidence":
@@ -1396,6 +1481,7 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
             class_labels,
             status_values=status_values,
             epoch=end_points.get("epoch", None),
+            matched_ious=matched_ious if set_criterion.proto_feature_mode == "matched_query" else None,
         )
         loss = loss + loss_proto
         end_points["loss_proto"] = loss_proto
@@ -1420,5 +1506,10 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         end_points["fallback_proto_count"] = zero
         end_points["weak_platform"] = zero
         end_points["strong_platform"] = zero
+        end_points["proto_pce_difficulty_aware_active"] = zero
+        end_points["proto_pce_hard_sample_ratio"] = zero
+        end_points["proto_pce_gate_mean"] = zero
+        end_points["proto_pce_gate_nonzero_count"] = zero
+        end_points["proto_pce_matched_iou_mean"] = zero
     end_points['loss'] = loss
     return loss, end_points

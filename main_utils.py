@@ -70,6 +70,10 @@ def parse_option():
     parser.add_argument("--proto_min_platform_seen", type=int, default=5)
     parser.add_argument("--proto_weak_pce_boost", type=float, default=1.0)
     parser.add_argument("--proto_max_pce_boost", type=float, default=2.0)
+    parser.add_argument("--proto_pce_difficulty_aware", action="store_true")
+    parser.add_argument("--proto_pce_hard_iou_thr", type=float, default=0.5)
+    parser.add_argument("--proto_pce_easy_iou_thr", type=float, default=0.6)
+    parser.add_argument("--proto_pce_gate_mode", type=str, default="hard", choices=["hard", "soft"])
     parser.add_argument("--use_difficulty_loss_weight", action="store_true")
     parser.add_argument("--difficulty_loss_weight", type=float, default=0.5)
     parser.add_argument("--difficulty_loss_max_weight", type=float, default=2.0)
@@ -87,6 +91,7 @@ def parse_option():
     parser.add_argument("--use_enclosing_aligned_gt_loss", action="store_true")
     parser.add_argument("--enclosing_gt_loss_weight", type=float, default=0.5)
     parser.add_argument("--enclosing_gt_apply_to", type=str, default="refine", choices=["refine"])
+    parser.add_argument("--use_enclosing_aligned_gt_as_box_target", action="store_true")
     parser.add_argument("--enable_platform_probe", action="store_true", help="Enable per-platform train-loss diagnostics.")
     parser.add_argument("--platform_probe_freq", type=int, default=100, help="Run platform probe every N train batches.")
     parser.add_argument("--platform_probe_warmup", type=int, default=1, help="Start platform probe from this epoch.")
@@ -263,6 +268,11 @@ class BaseTrainTester:
         "fallback_proto_count",
         "weak_platform",
         "strong_platform",
+        "proto_pce_difficulty_aware_active",
+        "proto_pce_hard_sample_ratio",
+        "proto_pce_gate_mean",
+        "proto_pce_gate_nonzero_count",
+        "proto_pce_matched_iou_mean",
     }
     PROTO_STAT_PREFIXES = (
         "platform_score_ema_",
@@ -274,12 +284,26 @@ class BaseTrainTester:
         "box_refine_active",
         "box_refine_delta_mean",
         "box_refine_delta_max",
+        "box_refine_use_enclosing_target",
         "box_refine_src_size_min",
         "box_refine_src_size_mean",
         "box_refine_tgt_size_min",
         "box_refine_tgt_size_mean",
+        "box_refine_target_size_min",
+        "box_refine_target_size_mean",
+        "box_refine_src_volume_mean",
+        "box_refine_target_volume_mean",
         "box_refine_src_center_abs_mean",
         "box_refine_tgt_center_abs_mean",
+    }
+    BOX_TARGET_STAT_KEYS = {
+        "enclosing_box_target_active",
+        "enclosing_box_target_size_mean",
+        "enclosing_box_target_size_min",
+        "enclosing_box_target_volume_mean",
+        "original_gt_size_mean",
+        "original_gt_volume_mean",
+        "enclosing_to_original_volume_ratio_mean",
     }
 
     @classmethod
@@ -293,6 +317,7 @@ class BaseTrainTester:
             or "acc" in key
             or "ratio" in key
             or key in cls.BOX_REFINE_STAT_KEYS
+            or key in cls.BOX_TARGET_STAT_KEYS
             or cls._is_proto_stat(key)
         )
 
@@ -465,6 +490,10 @@ class BaseTrainTester:
             proto_min_platform_seen=args.proto_min_platform_seen,
             proto_weak_pce_boost=args.proto_weak_pce_boost,
             proto_max_pce_boost=args.proto_max_pce_boost,
+            proto_pce_difficulty_aware=args.proto_pce_difficulty_aware,
+            proto_pce_hard_iou_thr=args.proto_pce_hard_iou_thr,
+            proto_pce_easy_iou_thr=args.proto_pce_easy_iou_thr,
+            proto_pce_gate_mode=args.proto_pce_gate_mode,
             use_difficulty_loss_weight=args.use_difficulty_loss_weight,
             difficulty_loss_weight=args.difficulty_loss_weight,
             difficulty_loss_max_weight=args.difficulty_loss_max_weight,
@@ -479,6 +508,7 @@ class BaseTrainTester:
             use_enclosing_aligned_gt_loss=args.use_enclosing_aligned_gt_loss,
             enclosing_gt_loss_weight=args.enclosing_gt_loss_weight,
             enclosing_gt_apply_to=args.enclosing_gt_apply_to,
+            use_enclosing_aligned_gt_as_box_target=args.use_enclosing_aligned_gt_as_box_target,
         )
         criterion = compute_hungarian_loss
 
