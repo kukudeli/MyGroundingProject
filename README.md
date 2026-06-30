@@ -1,69 +1,60 @@
-# 面向多平台 3D Grounding 的平台条件原型重平衡方法
+# MyGroundingProject
 
-本仓库是基于 3EED baseline 的研究扩展项目，面向多平台户外 3D grounding 场景，探索 drone、quadruped、vehicle 等不同平台在联合训练中的学习不平衡问题。项目在原始 3EED / BeaUTyDETR 主干基础上，加入一个训练阶段可插拔的平台条件原型重平衡模块，用于动态识别强势平台与弱势平台，并通过 PCE 和 PER 调节平台间学习状态。
+本仓库是基于 3EED / BeaUTyDETR baseline 的研究扩展项目，当前最终方法主线聚焦 drone + quad 联合 3D grounding。仓库不是 3EED 官方仓库，仍沿用 3EED 数据、训练入口和官方评估协议。
 
-需要说明：
+当前最终方法由三部分组成：
 
-- 本仓库不是 3EED 官方仓库。
-- 本项目基于 3EED 数据集、baseline 代码和评估协议进行研究扩展。
-- 原始 3EED 的任务是根据 LiDAR 点云、RGB 图像和自然语言表达预测目标 3D 边界框。
-- 本项目目前重点关注 drone 与 quad 的联合训练，并保留 waymo 平台兼容性。
+1. 基础 3EED 模型；
+2. 最小轴对齐外接框监督，即训练时将 rotated GT 转换为 axis-aligned enclosing GT 作为 box target；
+3. 第二阶段候选框级原型分类排序损失 prop-proto，用于 proposal ranking finetuning。
 
-## 1. 项目概述
+PCE/PER/platform prototype 代码仍保留，便于复现实验和对照，但不再作为最终方法主线。difficulty/reweight loss、box refine head、refine-only enclosing loss、proto_pce_difficulty_aware，以及 platform probe 的工具/脚本输出已从 clean 实验路径中清理或归档。
 
-任务输入：
+## 1. 项目状态
 
-- LiDAR 点云
-- RGB 图像
-- 自然语言表达
-- 平台标签，例如 waymo / drone / quad
+保留并推荐使用的最终方法模块：
 
-任务输出：
+- `train_dist_mod.py`：训练主入口。
+- `main_utils.py`：参数解析、criterion 构建、训练/日志流程。
+- `models/bdetr.py`：基础 3EED / BeaUTyDETR 主干与 query 特征输出。
+- `models/losses.py`：Hungarian loss、soft token loss、contrastive align loss、最小轴对齐 target 分支、prop-proto 接入。
+- `models/proposal_proto_loss.py`：proposal-level positive prototype ranking loss。
+- `src/grounding_evaluator.py`：官方评估路径，保持 rotated GT vs axis-aligned prediction 的 IoU 口径。
 
-- 语言所指目标的 3D bounding box
+已清理或归档的旧实验模块：
 
-研究问题：
+- difficulty / reweight loss；
+- box refine / refined_boxes / box_refine_head；
+- refine-only enclosing loss：`--use_enclosing_aligned_gt_loss`；
+- PCE 内部 difficulty gate：`--proto_pce_difficulty_aware`；
+- platform probe 工具与旧脚本。
 
-在多平台联合训练中，不同平台由于视角高度、点云稀疏程度、目标尺度、遮挡情况和场景覆盖范围不同，可能出现学习速度不一致。学习更快的平台可能主导共享表示空间，学习较慢的平台可能难以形成稳定类别特征。
+相关归档目录：
 
-本项目方法：
+```text
+archive_experiments/removed_module_artifacts/
+```
 
-在 3EED baseline 的基础上增加 Platform-conditioned Prototype Rebalancing 模块。该模块：
+重要说明：
 
-- 只在训练阶段启用；
-- 不改变原始 3D box 推理路径；
-- 维护平台条件类别原型；
-- 使用 EMA 动态估计平台学习状态；
-- 使用 PCE 增强弱势平台的类别聚类；
-- 使用 PER 抑制强势平台过早过度自信；
-- 支持 baseline / PCE / PER / PCE+PER 消融。
+- `--use_enclosing_aligned_gt_as_box_target` 是最终方法主线，必须保留。
+- `--use_enclosing_aligned_gt_loss` 是旧 refine-only loss，已清理，不应再使用。
+- `--use_prop_proto` 是第二阶段 prop-proto finetune 入口，必须保留。
+- PCE/PER 仍可通过 `--use_platform_proto --proto_use_pce --proto_use_per` 启用，但不是当前最终方法主线。
 
-## 2. 当前代码特性
+## 2. 环境配置
 
-- 保留 3EED / BeaUTyDETR 主干结构。
-- 在 `models/bdetr.py` 中额外导出 `proto_features` 作为原型模块输入。
-- 在 `models/prototype_rebalance.py` 中实现平台条件原型平衡模块。
-- 在 `models/losses.py` 中以可选方式追加 `loss_proto`。
-- 在 `main_utils.py` 中加入原型模块参数、日志和训练开关。
-- 在 `src/joint_det_dataset.py` 中使用平台标签支持平台级原型重平衡。
-- 支持通过命令行开关启用或关闭原型模块。
+本项目沿用原始 3EED 的环境依赖。请使用能正常运行 3EED baseline 的 Python、PyTorch、CUDA 和自定义 CUDA 算子环境。
 
-## 3. 环境配置
-
-本项目沿用 3EED 的环境依赖。请优先使用与原始 3EED baseline 一致的 Python、PyTorch、CUDA 和自定义 CUDA 算子环境。
-
-| 组件 | 推荐版本 |
+| 组件 | 建议 |
 |---|---|
 | Python | 3.10 或 3.11 |
-| PyTorch | 与 CUDA 匹配的版本 |
-| CUDA | 11.1 或 12.4 |
-| torchvision | 与 PyTorch 匹配 |
+| PyTorch | 与 CUDA 匹配 |
+| CUDA | 与编译环境一致 |
 | transformers | 支持 RoBERTa |
 | numpy / scipy / tqdm / tensorboard | 常规版本即可 |
 
-如果服务器已经能运行原始 3EED baseline，则通常不需要额外配置大量依赖，只需要确认新增代码所需的 PyTorch、TensorBoard 等基础包可用。
-
-### 3.1 编译自定义 CUDA 算子
+编译自定义 CUDA 算子：
 
 ```bash
 cd ops/teed_pointnet/pointnet2_batch
@@ -73,34 +64,19 @@ cd ../roiaware_pool3d
 python setup.py develop
 ```
 
-如果编译失败，优先检查 CUDA 版本、PyTorch 版本和 `CUDA_HOME` 是否正确。
-
-### 3.2 RoBERTa 权重
-
-本项目使用 RoBERTa 作为文本编码器。请下载 RoBERTa-base 权重，并放置到：
+RoBERTa 权重默认路径：
 
 ```text
 data/roberta_base/
 ```
 
-代码中默认从以下路径加载：
+## 3. 数据准备
 
-```text
-./data/roberta_base/
-```
-
-## 4. 数据准备
-
-本项目使用 3EED 数据集，数据组织方式沿用原始 3EED。
+数据组织沿用 3EED：
 
 ```text
 data/3eed/
 ├── drone/
-│   ├── scene-xxxx/
-│   │   ├── frame/
-│   │   │   ├── image.jpg
-│   │   │   ├── lidar.bin
-│   │   │   └── meta_info.json
 ├── quad/
 ├── waymo/
 ├── splits/
@@ -113,157 +89,177 @@ data/3eed/
 └── roberta_base/
 ```
 
-当前原型平衡实验主要使用：
+当前最终实验主要使用：
 
 ```bash
---dataset drone quad
---test_dataset drone quad
+--dataset quad drone
+--test_dataset quad drone
 ```
 
-也可以使用原始 3EED 脚本训练单平台或全平台模型。
+## 4. 推荐训练路径
 
-## 5. 代码使用方式
+### 4.1 Baseline 3EED
 
-### 5.1 原始 3EED-style 训练
+基础 drone + quad 训练可以直接使用 `train_dist_mod.py`：
 
 ```bash
-# 全平台训练
-bash scripts/train_3eed.sh
-
-# 单平台训练
-bash scripts/train_waymo.sh
-bash scripts/train_drone.sh
-bash scripts/train_quad.sh
+TORCH_DISTRIBUTED_DEBUG=INFO CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch \
+  --nproc_per_node 1 \
+  --master_port $((RANDOM % 30000 + 20000)) \
+  train_dist_mod.py --num_decoder_layers 6 \
+  --use_color \
+  --weight_decay 0.0005 \
+  --data_root data/3eed \
+  --split_dir data/3eed/splits \
+  --val_freq 5 --batch_size 16 --save_freq 5 --print_freq 100 \
+  --max_epoch 20 \
+  --lr_backbone=1e-3 --lr=1e-4 \
+  --dataset quad drone --test_dataset quad drone \
+  --detect_intermediate --joint_det \
+  --lr_decay_epochs 25 26 \
+  --use_soft_token_loss --use_contrastive_align \
+  --log_dir logs \
+  --self_attend
 ```
 
-这些脚本主要用于复现或对比原始 baseline 行为。
+### 4.2 Geometry-only：最小轴对齐监督
 
-### 5.2 drone + quad 原型平衡实验
-
-`scripts/train_proto_drone_quad.sh` 是当前项目的主要实验入口。它支持四种模式：
+推荐脚本：
 
 ```bash
-# 1. baseline：不启用原型平衡模块
-bash scripts/train_proto_drone_quad.sh baseline
-
-# 2. pce：只启用平台条件 Prototype Cross-Entropy
-bash scripts/train_proto_drone_quad.sh pce
-
-# 3. per：只启用 Prototype Entropy Regularization
-bash scripts/train_proto_drone_quad.sh per
-
-# 4. pce_per：启用完整原型平衡模块
-bash scripts/train_proto_drone_quad.sh pce_per
+bash scripts/train_enclosing_only_clean_20e.sh
 ```
 
-- `baseline`：原始 3EED-style drone + quad 联合训练，不启用原型平衡。
-- `pce`：启用平台条件原型交叉熵，主要验证原型聚类约束是否有效。
-- `per`：只启用强势平台熵正则，主要用于消融。
-- `pce_per`：启用完整平台原型重平衡模块。
+核心差异是启用：
 
-### 5.3 关键参数说明
+```bash
+--use_enclosing_aligned_gt_as_box_target
+```
+
+该分支只改变训练时 box target，将 rotated GT 转为最小 axis-aligned enclosing GT；评估仍保持官方方式，不改 IoU 口径。
+
+### 4.3 Geometry + Prop-Proto Finetune
+
+推荐从 geometry checkpoint 启动第二阶段 finetune：
+
+```bash
+bash scripts/finetune_prop_proto_from_enclosing20_w001_23e.sh
+```
+
+核心参数：
+
+```bash
+--use_enclosing_aligned_gt_as_box_target
+--use_prop_proto
+--prop_proto_weight 0.001
+--prop_proto_tau 0.07
+--prop_pos_iou_thr 0.5
+--prop_neg_iou_thr 0.25
+--prop_hn_topk 5
+```
+
+继续训练脚本：
+
+```bash
+bash scripts/resume_prop_proto_23to100.sh
+```
+
+## 5. Prop-Proto 方法说明
+
+`models/proposal_proto_loss.py` 定义 `ProposalPrototypeRankingLoss`。该损失不是直接复用 PCE/PER，而是借鉴“以 prototype 作为判别参照”的思想，并重构为候选框级排序约束。
+
+简要流程：
+
+- 对每个 proposal 计算与 GT box 的 IoU；
+- IoU 高于阈值的 proposal 作为 positive；
+- 若没有 positive，则使用 IoU 最大的 proposal 作为 fallback positive；
+- 使用 positive proposal features 按 IoU 加权聚合出动态 positive prototype；
+- 从低 IoU proposals 中选择语言分数高或与正原型相似的 hard negatives；
+- 使用 cosine/dot-product similarity 和 temperature `prop_proto_tau`；
+- 通过 `softplus((sim_neg - sim_pos) / tau)` 约束正候选框比 hard negative 更接近正原型。
+
+没有显式 negative prototype，也没有跨 batch/global prototype bank。
+
+## 6. PCE/PER 与旧实验模块
+
+PCE/PER/platform prototype 仍保留在代码中：
+
+- `models/prototype_rebalance.py`
+- `models/losses.py` 中 `use_platform_proto` 分支
+
+启用方式：
+
+```bash
+--use_platform_proto
+--proto_use_pce
+--proto_use_per
+```
+
+但它们不是当前最终方法主线。旧的 PCE/PER 脚本已归档：
 
 ```text
---use_platform_proto          启用平台原型平衡模块
---proto_use_pce               启用 PCE
---proto_use_per               启用 PER
---proto_pce_weight            PCE 损失权重
---proto_per_weight            PER 损失权重
---proto_score_momentum        平台状态 EMA 动量
---proto_gap_threshold         强弱平台差距阈值
---proto_warmup_epoch          动态重平衡 warmup epoch
---proto_min_platform_seen     平台参与强弱判断所需的最小累计样本数
---proto_weak_pce_boost        弱势平台 PCE 权重增强系数
---proto_max_pce_boost         弱势平台 PCE 最大增强上限
+archive_experiments/removed_module_artifacts/pceper_box_difficulty_scripts/
 ```
 
-### 5.4 推荐 smoke test
+不要把第二阶段 prop-proto 写成“直接使用 PCE/PER loss”。更准确的表述是：
 
-正式训练前建议先跑小规模测试，确认数据、平台标签、loss 和日志都正常。
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch --nproc_per_node 1 --master_port 29501 \
-train_dist_mod.py \
---num_decoder_layers 6 \
---use_color \
---data_root data/3eed \
---split_dir data/3eed/splits \
---dataset drone quad \
---test_dataset drone quad \
---batch_size 2 \
---max_epoch 1 \
---print_freq 1 \
---save_freq 1 \
---val_freq 1 \
---detect_intermediate \
---joint_det \
---use_soft_token_loss \
---use_contrastive_align \
---self_attend \
---debug \
---use_platform_proto \
---proto_use_pce \
---proto_use_per \
---flag smoke_pce_per
+```text
+借鉴 PCE/PER 的原型分类思想，并将其重构为候选框级原型分类排序损失。
 ```
 
-如果 smoke test 通过，再使用脚本进行正式训练。
+## 7. 评估
 
-## 6. 评估
+评估脚本仍保留：
 
 ```bash
-# 全平台评估
 bash scripts/val_3eed.sh
-
-# 单平台评估
-bash scripts/val_waymo.sh
 bash scripts/val_drone.sh
 bash scripts/val_quad.sh
+bash scripts/val_waymo.sh
 ```
 
-运行评估前需要在脚本中确认 `--checkpoint_path` 指向正确 checkpoint。
+评估前请确认脚本中的 `--checkpoint_path` 指向目标 checkpoint。
 
-对于原型平衡实验，建议不仅观察整体 Acc@25 / Acc@50，也要关注 drone 和 quad 的平台级性能差距。
+评估逻辑保持官方口径：
 
-## 7. 日志与诊断
+- prediction 为 axis-aligned box；
+- GT 仍使用 rotated GT；
+- IoU 使用 rotated GT vs axis-aligned prediction。
 
-训练时重点关注以下日志：
+## 8. 诊断与检查
 
-```text
-loss_proto
-loss_pce
-loss_per
-platform_gap
-status_ready
-pce_rebalance_active
-weak_pce_weight
-weak_platform
-strong_platform
-platform_score_ema_0 / 1 / 2
-platform_seen_count_0 / 1 / 2
-platform_batch_score_0 / 1 / 2
+清理后建议运行：
+
+```bash
+python3 -m py_compile main_utils.py train_dist_mod.py models/losses.py models/bdetr.py src/grounding_evaluator.py models/ap_helper.py
+bash scripts/check_no_difficulty_box_refine.sh
+bash scripts/check_removed_module_outputs.sh
 ```
 
-平台编号：
+smoke 日志检查脚本：
 
-```text
-0 = waymo
-1 = drone
-2 = quad
+```bash
+bash scripts/check_smoke_test_logs.sh
 ```
 
-这些指标用于判断原型模块是否真的检测到平台学习差异，以及 PCE/PER 是否按预期激活。
+几何诊断工具保留在 `tools/` 下，包括：
 
-## 8. 当前状态
+- `analyze_official_aligned_oracle.py`
+- `analyze_parking2_rotation_mismatch.py`
+- `analyze_platform_rotation_mismatch.py`
+- `debug_official_iou_consistency.py`
+- `evaluate_baseline_ignore_yaw.py`
+- `compare_enclosing20_vs_prop_proto_finetune23.py`
+- `compare_three_way_enclosing_prop_proto.py`
+- `extract_best_eval_epochs.py`
 
-当前项目仍处于研究开发阶段。已完成：
+## 9. 当前注意事项
 
-- 可插拔平台原型平衡模块；
-- 平台条件原型库；
-- 全局原型与 fallback 原型；
-- EMA-based 平台状态估计；
-- 弱势平台加权 PCE；
-- 强势平台 PER；
-- baseline / PCE / PER / PCE+PER 运行入口。
+- 不要提交 `data/`、`logs/`、checkpoints、prediction JSON 或大型输出文件。
+- `outputs/code_cleanup_review/` 中保留小型清理报告。
+- `platform_probe` 主代码入口暂时保留，后续如需完全清理应单独处理。
+- `proto_status_mode="box_difficulty"` 仍作为 PCE/PER 旧实验状态输入存在，不属于已删除的独立 difficulty/reweight loss。
 
-完整实验结果待补充。
+## 10. License
+
+本仓库基于原始 3EED / BeaUTyDETR 代码进行研究扩展。请同时遵守原始项目、数据集和依赖库的许可协议。
