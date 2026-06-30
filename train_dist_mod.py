@@ -97,9 +97,6 @@ class TrainTester(BaseTrainTester):
             butd=args.butd or args.butd_gt or args.butd_cls,
             pointnet_ckpt=args.pp_checkpoint,
             self_attend=args.self_attend,
-            use_box_refine_head=args.use_box_refine_head,
-            box_refine_delta_scale=args.box_refine_delta_scale,
-            box_refine_detach_base_box=args.box_refine_detach_base_box,
         )
         return model
 

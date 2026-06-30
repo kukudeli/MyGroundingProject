@@ -1,0 +1,104 @@
+【1. 本次清理范围】
+
+本次清理只处理已移除或不属于最终主线的输出、工具和脚本残留：
+- difficulty / reweight loss 相关残留；
+- box refine / refined_boxes / box_refine_head 相关残留；
+- refine-only enclosing loss，即 use_enclosing_aligned_gt_loss / enclosing_gt_loss_weight；
+- proto_pce_difficulty_aware / pce_difficulty_aware；
+- platform_probe / enable_platform_probe。
+
+明确不清理并保留：
+- rotation_mismatch、ignore_yaw、official_aligned_oracle、parking2、diagnostic、enclosing、prop_proto、three_way、best_eval、iou_consistency、baseline_ignore_yaw 相关几何诊断和最终方法输出；
+- outputs/prop_proto_loss_diagnostics；
+- outputs/code_cleanup_review；
+- outputs/smoke_tests。
+
+
+【2. 已归档的工具/脚本】
+
+已归档 3 个工具/脚本：
+
+- tools/plot_platform_probe.py
+  -> archive_experiments/removed_module_artifacts/platform_probe/tools/plot_platform_probe.py
+  原因：只服务 platform_probe 可视化。
+
+- scripts/train_3eed.sh
+  -> archive_experiments/removed_module_artifacts/platform_probe/scripts/train_3eed.sh
+  原因：脚本默认启用 --enable_platform_probe、--platform_probe_freq、--platform_probe_warmup。
+
+- scripts/train_proto_drone_quad.sh
+  -> archive_experiments/removed_module_artifacts/pceper_box_difficulty_scripts/train_proto_drone_quad.sh
+  原因：旧 PCE/PER 实验脚本显式使用 --proto_status_mode box_difficulty，不属于最终 clean script。
+
+说明：没有删除文件，均使用 mv 归档。
+
+
+【3. 已归档的 outputs/logs】
+
+已归档 outputs/logs 数量：0。
+
+检查时发现部分历史 prediction.json 中包含：
+- use_box_refine_head: false
+- box_refine_use_at_eval: false
+
+这些文件位于包含 use_enclosing_aligned_gt_as_box_target 或 prop_proto 配置的历史几何/最终方法实验 log run 下。根据“包含 enclosing / prop_proto 等保护关键词则保留”的规则，本次没有移动这些 logs/predictions，避免误伤几何主线输出。
+
+
+【4. 明确保留的几何诊断与最终方法文件】
+
+已确认保留以下工具：
+- tools/analyze_official_aligned_oracle.py
+- tools/analyze_parking2_c_failure_detail.py
+- tools/analyze_parking2_c_iou_decomposition.py
+- tools/analyze_parking2_rotation_mismatch.py
+- tools/analyze_platform_rotation_mismatch.py
+- tools/analyze_scene_parking2_failure.py
+- tools/build_diagnostic_subset.py
+- tools/debug_official_iou_consistency.py
+- tools/evaluate_baseline_ignore_yaw.py
+- tools/compare_enclosing20_vs_prop_proto_finetune23.py
+- tools/compare_three_way_enclosing_prop_proto.py
+- tools/extract_best_eval_epochs.py
+
+已确认未移动以下最终方法相关输出目录：
+- outputs/prop_proto_loss_diagnostics
+- outputs/code_cleanup_review
+- outputs/smoke_tests
+
+已确认没有移动 prop_proto / enclosing 主线脚本和输出。
+
+
+【5. 未处理但建议后续人工确认的残留】
+
+platform_probe 主代码入口仍存在：
+- main_utils.py：仍 import utils.platform_imbalance_probe.PlatformImbalanceProbe，并保留 --enable_platform_probe、--platform_probe_freq、--platform_probe_warmup、--platform_probe_names 等参数和训练日志调用。
+- train_dist_mod.py：仍有 args.enable_platform_probe 条件分支。
+- utils/platform_imbalance_probe.py：仍存在。
+
+本次按要求没有直接修改 main_utils.py / train_dist_mod.py 中的 platform_probe 代码。由于 main_utils.py 仍直接 import utils.platform_imbalance_probe，如果移动 utils/platform_imbalance_probe.py 会破坏 py_compile，因此该文件暂时保留，建议后续单独做一次主代码级 platform_probe 清理。
+
+PCE/PER 的 proto_status_mode="box_difficulty" 主代码路径仍保留在 models/losses.py 和 models/prototype_rebalance.py 中。它不是本次已删除的独立 difficulty/reweight loss，但命名上仍含 difficulty；如果最终论文/代码要完全去除 difficulty 命名，需要另开一次 PCE/PER 状态输入清理。
+
+已有检查脚本 scripts/check_no_difficulty_box_refine.sh 和 scripts/check_smoke_test_logs.sh 中包含旧关键词，这是检查脚本自身的匹配规则，不是旧模块实现。
+
+
+【6. 检查脚本结果】
+
+新增检查脚本：
+- scripts/check_removed_module_outputs.sh
+
+脚本行为：
+- 扫描 active tools / statistics / scripts / outputs / logs；
+- 允许 archive_experiments、code_backup、受保护输出目录和几何诊断白名单工具残留关键词；
+- 如果 log run 的 config/log 证明其属于 enclosing / prop_proto / diagnostic 等保护范围，则跳过该 run 下的历史输出；
+- 只输出未保护文件路径与命中关键词，不自动修改。
+
+验证结果：
+- python3 -m py_compile main_utils.py train_dist_mod.py models/losses.py models/bdetr.py src/grounding_evaluator.py models/ap_helper.py：通过。
+- bash scripts/check_removed_module_outputs.sh || true：通过，active tools/scripts/outputs/logs 未发现未保护的已移除模块关键词。
+
+最终判断：
+- difficulty/reweight active 残留：未发现。
+- box_refine active 残留：未发现。
+- proto_pce_difficulty_aware active 残留：未发现。
+- platform_probe active 残留：主代码仍存在，已记录为后续可清理项；tools/scripts 侧 platform_probe 已归档。

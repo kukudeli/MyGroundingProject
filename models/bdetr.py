@@ -53,9 +53,6 @@ class BeaUTyDETR(nn.Module):
         butd=True,
         pointnet_ckpt=None,
         self_attend=True,
-        use_box_refine_head=False,
-        box_refine_delta_scale=0.1,
-        box_refine_detach_base_box=False,
     ):
         """Initialize layers."""
         super().__init__()
@@ -65,9 +62,6 @@ class BeaUTyDETR(nn.Module):
         self.self_position_embedding = self_position_embedding
         self.contrastive_align_loss = contrastive_align_loss
         self.butd = butd
-        self.use_box_refine_head = use_box_refine_head
-        self.box_refine_delta_scale = box_refine_delta_scale
-        self.box_refine_detach_base_box = box_refine_detach_base_box
 
         # Visual encoder
         # ipdb.set_trace()
@@ -121,18 +115,6 @@ class BeaUTyDETR(nn.Module):
         self.prediction_heads = nn.ModuleList()
         for _ in range(self.num_decoder_layers):
             self.prediction_heads.append(ClsAgnosticPredictHead(num_class, 1, num_queries, d_model, objectness=False, heading=False, compute_sem_scores=True))
-
-        if self.use_box_refine_head:
-            self.box_refine_head = nn.Sequential(
-                nn.Linear(d_model + 6, d_model),
-                nn.ReLU(),
-                nn.Linear(d_model, d_model),
-                nn.ReLU(),
-                nn.Linear(d_model, 6),
-            )
-            last_layer = self.box_refine_head[-1]
-            nn.init.zeros_(last_layer.weight)
-            nn.init.zeros_(last_layer.bias)
 
         # Extra layers for contrastive losses
         if contrastive_align_loss:
@@ -273,25 +255,6 @@ class BeaUTyDETR(nn.Module):
 
             # Prediction
             base_xyz, base_size = self.prediction_heads[i](query.transpose(1, 2).contiguous(), base_xyz=cluster_xyz, end_points=end_points, prefix=prefix)  # (B, F, V)
-            if self.use_box_refine_head and prefix == "last_":
-                safe_size = base_size.clamp_min(1e-6)
-                base_box = torch.cat([base_xyz, safe_size], dim=-1)
-                refine_box_input = base_box.detach() if self.box_refine_detach_base_box else base_box
-                refine_input = torch.cat([query, refine_box_input], dim=-1)
-                delta = torch.tanh(self.box_refine_head(refine_input)) * float(self.box_refine_delta_scale)
-
-                # First conservative version refines axis-aligned center and size only.
-                # Size uses bounded multiplicative correction to stay positive.
-                refined_center = base_xyz + delta[..., :3]
-                refined_size = safe_size * torch.exp(delta[..., 3:])
-                refined_size = refined_size.clamp_min(1e-6)
-                refined_box = torch.cat([refined_center, refined_size], dim=-1)
-
-                end_points[f"{prefix}refined_center"] = refined_center
-                end_points[f"{prefix}refined_pred_size"] = refined_size
-                end_points[f"{prefix}refined_boxes"] = refined_box
-                end_points["box_refine_delta_mean"] = delta.detach().abs().mean()
-                end_points["box_refine_delta_max"] = delta.detach().abs().max()
             base_xyz = base_xyz.detach().clone()
             base_size = base_size.detach().clone()
 

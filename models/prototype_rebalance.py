@@ -28,10 +28,6 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         weak_pce_boost=1.0,
         max_pce_boost=2.0,
         status_mode="box_difficulty",
-        pce_difficulty_aware=False,
-        pce_hard_iou_thr=0.5,
-        pce_easy_iou_thr=0.6,
-        pce_gate_mode="hard",
     ):
         super().__init__()
         self.projector = nn.Sequential(
@@ -55,14 +51,6 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         self.weak_pce_boost = weak_pce_boost
         self.max_pce_boost = max_pce_boost
         self.status_mode = status_mode
-        self.pce_difficulty_aware = pce_difficulty_aware
-        self.pce_hard_iou_thr = pce_hard_iou_thr
-        self.pce_easy_iou_thr = pce_easy_iou_thr
-        self.pce_gate_mode = pce_gate_mode
-        if self.pce_gate_mode not in {"hard", "soft"}:
-            raise ValueError(f"Unknown pce_gate_mode: {self.pce_gate_mode}")
-        if float(self.pce_easy_iou_thr) < float(self.pce_hard_iou_thr):
-            raise ValueError("pce_easy_iou_thr must be >= pce_hard_iou_thr")
 
         self.register_buffer("prototypes", torch.zeros(num_platforms, num_classes, proto_dim))
         self.register_buffer("prototype_initialized", torch.zeros(num_platforms, num_classes, dtype=torch.bool))
@@ -184,28 +172,7 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         weak_platform = int(ready_indices[weak_pos].item())
         return strong_platform, weak_platform, platform_gap, True
 
-    def _build_pce_difficulty_gate(self, matched_ious, features):
-        if matched_ious is None:
-            gate = torch.ones((features.shape[0],), dtype=features.dtype, device=features.device)
-            matched_iou_mean = features.new_zeros(())
-            hard_ratio = features.new_zeros(())
-            return gate.detach(), matched_iou_mean, hard_ratio
-
-        matched_ious = matched_ious.to(device=features.device, dtype=features.dtype).detach()
-        matched_ious = matched_ious.clamp(min=0.0, max=1.0)
-        hard_thr = float(self.pce_hard_iou_thr)
-        easy_thr = float(self.pce_easy_iou_thr)
-        if self.pce_gate_mode == "hard":
-            gate = (matched_ious < hard_thr).to(dtype=features.dtype)
-        elif self.pce_gate_mode == "soft":
-            denom = max(easy_thr - hard_thr, 1e-6)
-            gate = ((easy_thr - matched_ious) / denom).clamp(min=0.0, max=1.0)
-        else:
-            raise ValueError(f"Unknown pce_gate_mode: {self.pce_gate_mode}")
-        hard_ratio = (matched_ious < hard_thr).to(dtype=features.dtype).mean()
-        return gate.detach(), matched_ious.mean().detach(), hard_ratio.detach()
-
-    def forward(self, features, platform_labels, class_labels, status_values=None, epoch=None, matched_ious=None):
+    def forward(self, features, platform_labels, class_labels, status_values=None, epoch=None):
         device = features.device
         if features.numel() == 0:
             zero = self._zero(features)
@@ -232,8 +199,6 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         class_labels = class_labels[valid]
         if status_values is not None:
             status_values = status_values.to(device=device, dtype=features.dtype)[valid]
-        if matched_ious is not None:
-            matched_ious = matched_ious.to(device=device, dtype=features.dtype)[valid]
         num_valid_samples = int(features.shape[0])
         num_active_platforms = int(platform_labels.unique().numel())
 
@@ -259,10 +224,6 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         pce_active = bool(self.use_pce and num_valid_samples > 0)
         pce_rebalance_active = bool(pce_active and weak_platform >= 0 and status_ready and gap_over_threshold)
         weak_pce_weight = self._zero(features) + 1.0
-        pce_difficulty_aware_active = bool(pce_active and self.pce_difficulty_aware)
-        pce_gate = torch.ones((num_valid_samples,), dtype=features.dtype, device=device)
-        pce_matched_iou_mean = self._zero(features)
-        pce_hard_sample_ratio = self._zero(features)
         if pce_active:
             loss_pce_each = F.cross_entropy(logits, class_labels, reduction="none")
             sample_weights = torch.ones_like(loss_pce_each)
@@ -271,13 +232,7 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
                 weak_pce_weight = 1.0 + self.weak_pce_boost * rebalance_strength
                 weak_mask = platform_labels == weak_platform
                 sample_weights = torch.where(weak_mask, weak_pce_weight.to(sample_weights.dtype), sample_weights)
-            if pce_difficulty_aware_active:
-                pce_gate, pce_matched_iou_mean, pce_hard_sample_ratio = self._build_pce_difficulty_gate(matched_ious, features)
-                gated_weights = sample_weights * pce_gate
-                denom = gated_weights.sum().clamp_min(1.0)
-                loss_pce_raw = (loss_pce_each * gated_weights).sum() / denom
-            else:
-                loss_pce_raw = (loss_pce_each * sample_weights).mean()
+            loss_pce_raw = (loss_pce_each * sample_weights).mean()
         else:
             loss_pce_raw = self._zero(features)
         loss_pce = loss_pce_raw * self.pce_weight
@@ -323,11 +278,6 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
             fallback_proto_count,
             batch_scores,
             batch_valid,
-            pce_difficulty_aware_active,
-            pce_hard_sample_ratio,
-            pce_gate.detach().mean() if pce_gate.numel() > 0 else self._zero(features),
-            int((pce_gate.detach() > 0).sum().item()) if pce_gate.numel() > 0 else 0,
-            pce_matched_iou_mean,
         )
 
     def _stats(
@@ -350,27 +300,10 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
         fallback_proto_count,
         batch_scores,
         batch_valid,
-        pce_difficulty_aware_active=False,
-        pce_hard_sample_ratio=None,
-        pce_gate_mean=None,
-        pce_gate_nonzero_count=0,
-        pce_matched_iou_mean=None,
     ):
         device = loss_pce.device
         if not torch.is_tensor(weak_pce_weight):
             weak_pce_weight = torch.tensor(float(weak_pce_weight), device=device)
-        if pce_hard_sample_ratio is None:
-            pce_hard_sample_ratio = torch.zeros((), device=device)
-        elif not torch.is_tensor(pce_hard_sample_ratio):
-            pce_hard_sample_ratio = torch.tensor(float(pce_hard_sample_ratio), device=device)
-        if pce_gate_mean is None:
-            pce_gate_mean = torch.zeros((), device=device)
-        elif not torch.is_tensor(pce_gate_mean):
-            pce_gate_mean = torch.tensor(float(pce_gate_mean), device=device)
-        if pce_matched_iou_mean is None:
-            pce_matched_iou_mean = torch.zeros((), device=device)
-        elif not torch.is_tensor(pce_matched_iou_mean):
-            pce_matched_iou_mean = torch.tensor(float(pce_matched_iou_mean), device=device)
         stats = {
             "loss_pce": loss_pce.detach(),
             "loss_per": loss_per.detach(),
@@ -388,11 +321,6 @@ class PlatformPrototypeRebalanceLoss(nn.Module):
             "fallback_proto_count": torch.tensor(float(fallback_proto_count), device=device),
             "weak_platform": torch.tensor(float(weak_platform), device=device),
             "strong_platform": torch.tensor(float(strong_platform), device=device),
-            "proto_pce_difficulty_aware_active": torch.tensor(float(pce_difficulty_aware_active), device=device),
-            "proto_pce_hard_sample_ratio": pce_hard_sample_ratio.detach().to(device),
-            "proto_pce_gate_mean": pce_gate_mean.detach().to(device),
-            "proto_pce_gate_nonzero_count": torch.tensor(float(pce_gate_nonzero_count), device=device),
-            "proto_pce_matched_iou_mean": pce_matched_iou_mean.detach().to(device),
         }
         for platform_idx in range(len(self.platform_score_ema)):
             stats[f"platform_score_ema_{platform_idx}"] = self.platform_score_ema[platform_idx].detach().to(device)

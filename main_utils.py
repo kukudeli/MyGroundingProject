@@ -70,28 +70,14 @@ def parse_option():
     parser.add_argument("--proto_min_platform_seen", type=int, default=5)
     parser.add_argument("--proto_weak_pce_boost", type=float, default=1.0)
     parser.add_argument("--proto_max_pce_boost", type=float, default=2.0)
-    parser.add_argument("--proto_pce_difficulty_aware", action="store_true")
-    parser.add_argument("--proto_pce_hard_iou_thr", type=float, default=0.5)
-    parser.add_argument("--proto_pce_easy_iou_thr", type=float, default=0.6)
-    parser.add_argument("--proto_pce_gate_mode", type=str, default="hard", choices=["hard", "soft"])
-    parser.add_argument("--use_difficulty_loss_weight", action="store_true")
-    parser.add_argument("--difficulty_loss_weight", type=float, default=0.5)
-    parser.add_argument("--difficulty_loss_max_weight", type=float, default=2.0)
-    parser.add_argument("--difficulty_loss_warmup_epoch", type=int, default=5)
-    parser.add_argument("--difficulty_loss_apply_to", type=str, default="bbox_giou", choices=["bbox_giou"])
-    parser.add_argument("--difficulty_loss_mode", type=str, default="platform", choices=["platform", "mid_iou"])
-    parser.add_argument("--difficulty_iou_low", type=float, default=0.25)
-    parser.add_argument("--difficulty_iou_high", type=float, default=0.5)
-    parser.add_argument("--difficulty_mid_iou_weight", type=float, default=0.3)
-    parser.add_argument("--use_box_refine_head", action="store_true")
-    parser.add_argument("--box_refine_loss_weight", type=float, default=1.0)
-    parser.add_argument("--box_refine_delta_scale", type=float, default=0.1)
-    parser.add_argument("--box_refine_use_at_eval", action="store_true")
-    parser.add_argument("--box_refine_detach_base_box", action="store_true")
-    parser.add_argument("--use_enclosing_aligned_gt_loss", action="store_true")
-    parser.add_argument("--enclosing_gt_loss_weight", type=float, default=0.5)
-    parser.add_argument("--enclosing_gt_apply_to", type=str, default="refine", choices=["refine"])
     parser.add_argument("--use_enclosing_aligned_gt_as_box_target", action="store_true")
+    parser.add_argument("--use_prop_proto", action="store_true")
+    parser.add_argument("--prop_proto_weight", type=float, default=0.0)
+    parser.add_argument("--prop_proto_tau", type=float, default=0.07)
+    parser.add_argument("--prop_pos_iou_thr", type=float, default=0.5)
+    parser.add_argument("--prop_neg_iou_thr", type=float, default=0.25)
+    parser.add_argument("--prop_hn_topk", type=int, default=5)
+    parser.add_argument("--prop_proto_warmup_epoch", type=int, default=0)
     parser.add_argument("--enable_platform_probe", action="store_true", help="Enable per-platform train-loss diagnostics.")
     parser.add_argument("--platform_probe_freq", type=int, default=100, help="Run platform probe every N train batches.")
     parser.add_argument("--platform_probe_warmup", type=int, default=1, help="Start platform probe from this epoch.")
@@ -142,7 +128,7 @@ def parse_option():
     parser.add_argument("--val_freq", type=int, default=5)  # epoch-wise
 
     # others
-    parser.add_argument("--local_rank", type=int, help="local rank for DistributedDataParallel")
+    parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int, help="local rank for DistributedDataParallel")
     parser.add_argument("--ap_iou_thresholds", type=float, default=[0.25, 0.5], nargs="+", help="A list of AP IoU thresholds")
     parser.add_argument("--rng_seed", type=int, default=0, help="manual seed")
     parser.add_argument(
@@ -157,7 +143,9 @@ def parse_option():
     parser.add_argument("--pp_checkpoint", default=None)
     parser.add_argument("--reduce_lr", action="store_true")
 
-    args, _ = parser.parse_known_args()
+    args, unknown_args = parser.parse_known_args()
+    if unknown_args:
+        parser.error("unrecognized arguments: " + " ".join(unknown_args))
 
     args.eval = args.eval or args.eval_train
     
@@ -268,11 +256,10 @@ class BaseTrainTester:
         "fallback_proto_count",
         "weak_platform",
         "strong_platform",
-        "proto_pce_difficulty_aware_active",
-        "proto_pce_hard_sample_ratio",
-        "proto_pce_gate_mean",
-        "proto_pce_gate_nonzero_count",
-        "proto_pce_matched_iou_mean",
+        "prop_proto_active",
+        "prop_proto_pos_count",
+        "prop_proto_neg_count",
+        "prop_proto_fallback_pos_count",
     }
     PROTO_STAT_PREFIXES = (
         "platform_score_ema_",
@@ -280,22 +267,6 @@ class BaseTrainTester:
         "platform_batch_score_",
         "platform_batch_valid_",
     )
-    BOX_REFINE_STAT_KEYS = {
-        "box_refine_active",
-        "box_refine_delta_mean",
-        "box_refine_delta_max",
-        "box_refine_use_enclosing_target",
-        "box_refine_src_size_min",
-        "box_refine_src_size_mean",
-        "box_refine_tgt_size_min",
-        "box_refine_tgt_size_mean",
-        "box_refine_target_size_min",
-        "box_refine_target_size_mean",
-        "box_refine_src_volume_mean",
-        "box_refine_target_volume_mean",
-        "box_refine_src_center_abs_mean",
-        "box_refine_tgt_center_abs_mean",
-    }
     BOX_TARGET_STAT_KEYS = {
         "enclosing_box_target_active",
         "enclosing_box_target_size_mean",
@@ -316,7 +287,6 @@ class BaseTrainTester:
             "loss" in key
             or "acc" in key
             or "ratio" in key
-            or key in cls.BOX_REFINE_STAT_KEYS
             or key in cls.BOX_TARGET_STAT_KEYS
             or cls._is_proto_stat(key)
         )
@@ -339,6 +309,16 @@ class BaseTrainTester:
                 json.dump(vars(args), f, indent=2)
             self.logger.info("Full config saved to {}".format(path))
             self.logger.info(str(vars(args)))
+            self.logger.info(
+                "ProposalPrototypeRankingLoss config: "
+                f"use_prop_proto={args.use_prop_proto}, "
+                f"prop_proto_weight={args.prop_proto_weight}, "
+                f"prop_proto_tau={args.prop_proto_tau}, "
+                f"prop_pos_iou_thr={args.prop_pos_iou_thr}, "
+                f"prop_neg_iou_thr={args.prop_neg_iou_thr}, "
+                f"prop_hn_topk={args.prop_hn_topk}, "
+                f"prop_proto_warmup_epoch={args.prop_proto_warmup_epoch}"
+            )
 
         # Backup used python files
         # Main process saves config and backs up code
@@ -490,25 +470,14 @@ class BaseTrainTester:
             proto_min_platform_seen=args.proto_min_platform_seen,
             proto_weak_pce_boost=args.proto_weak_pce_boost,
             proto_max_pce_boost=args.proto_max_pce_boost,
-            proto_pce_difficulty_aware=args.proto_pce_difficulty_aware,
-            proto_pce_hard_iou_thr=args.proto_pce_hard_iou_thr,
-            proto_pce_easy_iou_thr=args.proto_pce_easy_iou_thr,
-            proto_pce_gate_mode=args.proto_pce_gate_mode,
-            use_difficulty_loss_weight=args.use_difficulty_loss_weight,
-            difficulty_loss_weight=args.difficulty_loss_weight,
-            difficulty_loss_max_weight=args.difficulty_loss_max_weight,
-            difficulty_loss_warmup_epoch=args.difficulty_loss_warmup_epoch,
-            difficulty_loss_apply_to=args.difficulty_loss_apply_to,
-            difficulty_loss_mode=args.difficulty_loss_mode,
-            difficulty_iou_low=args.difficulty_iou_low,
-            difficulty_iou_high=args.difficulty_iou_high,
-            difficulty_mid_iou_weight=args.difficulty_mid_iou_weight,
-            use_box_refine_head=args.use_box_refine_head,
-            box_refine_loss_weight=args.box_refine_loss_weight,
-            use_enclosing_aligned_gt_loss=args.use_enclosing_aligned_gt_loss,
-            enclosing_gt_loss_weight=args.enclosing_gt_loss_weight,
-            enclosing_gt_apply_to=args.enclosing_gt_apply_to,
             use_enclosing_aligned_gt_as_box_target=args.use_enclosing_aligned_gt_as_box_target,
+            use_prop_proto=args.use_prop_proto,
+            prop_proto_weight=args.prop_proto_weight,
+            prop_proto_tau=args.prop_proto_tau,
+            prop_pos_iou_thr=args.prop_pos_iou_thr,
+            prop_neg_iou_thr=args.prop_neg_iou_thr,
+            prop_hn_topk=args.prop_hn_topk,
+            prop_proto_warmup_epoch=args.prop_proto_warmup_epoch,
         )
         criterion = compute_hungarian_loss
 
@@ -722,8 +691,6 @@ class BaseTrainTester:
 
         # Forward pass
         end_points = model(inputs)
-        end_points["use_box_refine_head"] = bool(args.use_box_refine_head)
-        end_points["box_refine_use_at_eval"] = bool(args.use_box_refine_head and args.box_refine_use_at_eval)
 
         # Compute loss
         for key in batch_data:

@@ -15,61 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from .prototype_rebalance import PlatformPrototypeRebalanceLoss
-
-
-DIFFICULTY_LOSS_STAT_KEYS = {
-    "difficulty_loss_active",
-    "difficulty_loss_mode_id",
-    "difficulty_loss_mean_weight",
-    "difficulty_loss_max_weight",
-    "difficulty_loss_num_weighted_samples",
-    "difficulty_loss_mid_iou_ratio",
-    "difficulty_loss_iou_mean",
-    "difficulty_loss_iou_low",
-    "difficulty_loss_iou_high",
-    "difficulty_loss_weighted_platform",
-    "difficulty_loss_platform_gap",
-}
-
-BOX_REFINE_LOSS_STAT_KEYS = {
-    "box_refine_use_enclosing_target",
-    "box_refine_src_size_min",
-    "box_refine_src_size_mean",
-    "box_refine_tgt_size_min",
-    "box_refine_tgt_size_mean",
-    "box_refine_target_size_min",
-    "box_refine_target_size_mean",
-    "box_refine_src_volume_mean",
-    "box_refine_target_volume_mean",
-    "box_refine_src_center_abs_mean",
-    "box_refine_tgt_center_abs_mean",
-    "loss_bbox_refine_raw",
-    "loss_giou_refine_raw",
-}
-
-
-def _aggregate_difficulty_loss_stats(stats_list):
-    if len(stats_list) == 0:
-        return {}
-
-    aggregate = {}
-    for key in DIFFICULTY_LOSS_STAT_KEYS:
-        values = [stats[key] for stats in stats_list if key in stats]
-        if len(values) == 0:
-            continue
-        first = values[0]
-        device = first.device if torch.is_tensor(first) else None
-        stacked = torch.stack([
-            value if torch.is_tensor(value) else torch.tensor(float(value), device=device)
-            for value in values
-        ])
-        if key == "difficulty_loss_num_weighted_samples":
-            aggregate[key] = stacked.sum()
-        elif key in {"difficulty_loss_active", "difficulty_loss_mode_id", "difficulty_loss_max_weight"}:
-            aggregate[key] = stacked.max()
-        else:
-            aggregate[key] = stacked.mean()
-    return aggregate
+from .proposal_proto_loss import ProposalPrototypeRankingLoss
 
 
 def is_dist_avail_and_initialized():
@@ -474,25 +420,14 @@ class SetCriterion(nn.Module):
         proto_min_platform_seen=5,
         proto_weak_pce_boost=1.0,
         proto_max_pce_boost=2.0,
-        proto_pce_difficulty_aware=False,
-        proto_pce_hard_iou_thr=0.5,
-        proto_pce_easy_iou_thr=0.6,
-        proto_pce_gate_mode="hard",
-        use_difficulty_loss_weight=False,
-        difficulty_loss_weight=0.5,
-        difficulty_loss_max_weight=2.0,
-        difficulty_loss_warmup_epoch=5,
-        difficulty_loss_apply_to="bbox_giou",
-        difficulty_loss_mode="platform",
-        difficulty_iou_low=0.25,
-        difficulty_iou_high=0.5,
-        difficulty_mid_iou_weight=0.3,
-        use_box_refine_head=False,
-        box_refine_loss_weight=1.0,
-        use_enclosing_aligned_gt_loss=False,
-        enclosing_gt_loss_weight=0.5,
-        enclosing_gt_apply_to="refine",
         use_enclosing_aligned_gt_as_box_target=False,
+        use_prop_proto=False,
+        prop_proto_weight=0.0,
+        prop_proto_tau=0.07,
+        prop_pos_iou_thr=0.5,
+        prop_neg_iou_thr=0.25,
+        prop_hn_topk=5,
+        prop_proto_warmup_epoch=0,
     ):
         """
         Parameters:
@@ -513,36 +448,14 @@ class SetCriterion(nn.Module):
         self.proto_score_momentum = proto_score_momentum
         self.proto_min_platform_samples = proto_min_platform_samples
         self.proto_min_platform_seen = proto_min_platform_seen
-        self.use_difficulty_loss_weight = use_difficulty_loss_weight
-        self.difficulty_loss_weight = difficulty_loss_weight
-        self.difficulty_loss_max_weight = difficulty_loss_max_weight
-        self.difficulty_loss_warmup_epoch = difficulty_loss_warmup_epoch
-        self.difficulty_loss_apply_to = difficulty_loss_apply_to
-        self.difficulty_loss_mode = difficulty_loss_mode
-        self.difficulty_iou_low = difficulty_iou_low
-        self.difficulty_iou_high = difficulty_iou_high
-        self.difficulty_mid_iou_weight = difficulty_mid_iou_weight
-        self.use_box_refine_head = use_box_refine_head
-        self.box_refine_loss_weight = box_refine_loss_weight
-        self.use_enclosing_aligned_gt_loss = use_enclosing_aligned_gt_loss
-        self.enclosing_gt_loss_weight = enclosing_gt_loss_weight
-        self.enclosing_gt_apply_to = enclosing_gt_apply_to
         self.use_enclosing_aligned_gt_as_box_target = use_enclosing_aligned_gt_as_box_target
-        if self.enclosing_gt_apply_to not in {"refine"}:
-            raise ValueError(f"Unknown enclosing_gt_apply_to: {self.enclosing_gt_apply_to}")
-        if float(self.enclosing_gt_loss_weight) < 0.0:
-            raise ValueError("enclosing_gt_loss_weight must be non-negative")
-        if self.difficulty_loss_apply_to != "bbox_giou":
-            raise ValueError(f"Unknown difficulty_loss_apply_to: {self.difficulty_loss_apply_to}")
-        if self.difficulty_loss_mode not in {"platform", "mid_iou"}:
-            raise ValueError(f"Unknown difficulty_loss_mode: {self.difficulty_loss_mode}")
-        if float(self.difficulty_iou_high) < float(self.difficulty_iou_low):
-            raise ValueError("difficulty_iou_high must be >= difficulty_iou_low")
-        if proto_pce_difficulty_aware and proto_feature_mode != "matched_query":
-            raise ValueError("proto_pce_difficulty_aware requires proto_feature_mode='matched_query'")
-        self.register_buffer("difficulty_platform_score_ema", torch.zeros(num_platforms))
-        self.register_buffer("difficulty_platform_score_initialized", torch.zeros(num_platforms, dtype=torch.bool))
-        self.register_buffer("difficulty_platform_seen_count", torch.zeros(num_platforms))
+        self.use_prop_proto = use_prop_proto
+        self.prop_proto_weight = prop_proto_weight
+        self.prop_proto_tau = prop_proto_tau
+        self.prop_pos_iou_thr = prop_pos_iou_thr
+        self.prop_neg_iou_thr = prop_neg_iou_thr
+        self.prop_hn_topk = prop_hn_topk
+        self.prop_proto_warmup_epoch = prop_proto_warmup_epoch
         if self.use_platform_proto:
             self.platform_proto_loss = PlatformPrototypeRebalanceLoss(
                 in_dim=proto_in_dim,
@@ -563,17 +476,16 @@ class SetCriterion(nn.Module):
                 min_platform_seen=proto_min_platform_seen,
                 weak_pce_boost=proto_weak_pce_boost,
                 max_pce_boost=proto_max_pce_boost,
-                pce_difficulty_aware=proto_pce_difficulty_aware,
-                pce_hard_iou_thr=proto_pce_hard_iou_thr,
-                pce_easy_iou_thr=proto_pce_easy_iou_thr,
-                pce_gate_mode=proto_pce_gate_mode,
             )
-
-    def _use_enclosing_refine_target(self):
-        return (
-            self.use_enclosing_aligned_gt_loss
-            and self.enclosing_gt_apply_to == "refine"
-        )
+        if self.use_prop_proto:
+            self.proposal_proto_loss = ProposalPrototypeRankingLoss(
+                weight=prop_proto_weight,
+                tau=prop_proto_tau,
+                pos_iou_thr=prop_pos_iou_thr,
+                neg_iou_thr=prop_neg_iou_thr,
+                hard_negative_topk=prop_hn_topk,
+                warmup_epoch=prop_proto_warmup_epoch,
+            )
 
     def loss_labels_st(self, outputs, targets, indices, num_boxes):
         """Soft token prediction (with objectness)."""
@@ -612,15 +524,7 @@ class SetCriterion(nn.Module):
 
         return losses
 
-    def loss_boxes(
-        self,
-        outputs,
-        targets,
-        indices,
-        num_boxes,
-        difficulty_sample_weights=None,
-        difficulty_epoch=None,
-    ):
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute bbox losses."""
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
@@ -644,154 +548,8 @@ class SetCriterion(nn.Module):
         loss_giou = 1 - torch.diag(generalized_box_iou3d(
             box_cxcyczwhd_to_xyzxyz(src_boxes),
             box_cxcyczwhd_to_xyzxyz(target_boxes)))
-        loss_bbox_per_match = loss_bbox.sum(dim=-1)
-
-        match_weights = None
-        difficulty_stats = None
-        if self.difficulty_loss_mode == "platform":
-            if difficulty_sample_weights is not None:
-                match_weights = difficulty_sample_weights.to(
-                    device=src_boxes.device,
-                    dtype=src_boxes.dtype,
-                )[idx[0]]
-        elif self.difficulty_loss_mode == "mid_iou":
-            match_weights, difficulty_stats = self.get_mid_iou_difficulty_loss_match_weights(
-                src_boxes,
-                target_boxes,
-                epoch=difficulty_epoch,
-            )
-
-        if match_weights is None:
-            losses['loss_bbox'] = loss_bbox.sum() / num_boxes
-            losses['loss_giou'] = loss_giou.sum() / num_boxes
-            if difficulty_stats is not None:
-                losses.update(difficulty_stats)
-            return losses
-
-        losses['loss_bbox'] = (loss_bbox_per_match * match_weights).sum() / num_boxes
-        losses['loss_giou'] = (loss_giou * match_weights).sum() / num_boxes
-
-        extra_weights = (match_weights - 1.0).clamp_min(0.0)
-        losses['difficulty_loss_bbox_contrib'] = (
-            loss_bbox_per_match * extra_weights
-        ).sum() / num_boxes
-        losses['difficulty_loss_giou_contrib'] = (
-            loss_giou * extra_weights
-        ).sum() / num_boxes
-        if difficulty_stats is not None:
-            losses.update(difficulty_stats)
-        return losses
-
-    def loss_refined_boxes(self, outputs, targets, indices, num_boxes):
-        """Compute refined box losses using the original Hungarian matches."""
-        refined_boxes = outputs.get("refined_boxes", None)
-        if refined_boxes is None:
-            device = outputs["pred_boxes"].device
-            zero = outputs["pred_boxes"].sum() * 0.0
-            return {
-                "loss_bbox_refine": zero,
-                "loss_giou_refine": zero,
-                "box_refine_active": torch.zeros((), device=device),
-            }
-
-        if refined_boxes.shape[-1] != 6:
-            raise ValueError(
-                f"refined_boxes must be center+size 6D boxes, got shape {tuple(refined_boxes.shape)}"
-            )
-
-        matched_count = sum(int(src.numel()) for src, _ in indices)
-        if matched_count == 0:
-            zero = outputs["pred_boxes"].sum() * 0.0
-            return {
-                "loss_bbox_refine": zero,
-                "loss_giou_refine": zero,
-                "box_refine_active": torch.zeros((), device=outputs["pred_boxes"].device),
-            }
-
-        idx = self._get_src_permutation_idx(indices)
-        src_boxes = refined_boxes[idx]
-        target_key = "boxes_enclosing_aligned" if self._use_enclosing_refine_target() else "boxes"
-        missing_target = any(target_key not in t for t in targets)
-        if missing_target:
-            raise KeyError(f"Refine loss requested missing target key: {target_key}")
-        target_boxes = torch.cat([
-            t[target_key][i] for t, (_, i) in zip(targets, indices)
-        ], dim=0)
-
-        if not torch.isfinite(src_boxes).all():
-            raise FloatingPointError("Non-finite values found in refined boxes before refine loss.")
-        if not torch.isfinite(target_boxes).all():
-            raise FloatingPointError("Non-finite values found in target boxes before refine loss.")
-
-        src_size = src_boxes[..., 3:]
-        tgt_size = target_boxes[..., 3:]
-        if (src_size <= 0).any():
-            raise ValueError(
-                f"Refined box sizes must be positive, min={src_size.detach().min().item():.6g}"
-            )
-        if (tgt_size <= 0).any():
-            raise ValueError(
-                f"Target box sizes must be positive for refine loss, min={tgt_size.detach().min().item():.6g}"
-            )
-
-        src_volume = src_size.prod(dim=-1)
-        tgt_volume = tgt_size.prod(dim=-1)
-        debug_stats = {
-            "box_refine_use_enclosing_target": torch.tensor(
-                float(self._use_enclosing_refine_target()), device=src_boxes.device
-            ),
-            "box_refine_src_size_min": src_size.detach().min(),
-            "box_refine_src_size_mean": src_size.detach().mean(),
-            "box_refine_tgt_size_min": tgt_size.detach().min(),
-            "box_refine_tgt_size_mean": tgt_size.detach().mean(),
-            "box_refine_target_size_min": tgt_size.detach().min(),
-            "box_refine_target_size_mean": tgt_size.detach().mean(),
-            "box_refine_src_volume_mean": src_volume.detach().mean(),
-            "box_refine_target_volume_mean": tgt_volume.detach().mean(),
-            "box_refine_src_center_abs_mean": src_boxes[..., :3].detach().abs().mean(),
-            "box_refine_tgt_center_abs_mean": target_boxes[..., :3].detach().abs().mean(),
-        }
-
-        loss_bbox_refine_per_dim = (
-            F.l1_loss(
-                src_boxes[..., :3], target_boxes[..., :3],
-                reduction='none'
-            )
-            + 0.2 * F.l1_loss(
-                src_boxes[..., 3:], target_boxes[..., 3:],
-                reduction='none'
-            )
-        )
-        if not torch.isfinite(loss_bbox_refine_per_dim).all():
-            raise FloatingPointError("Non-finite L1 refine bbox loss values found.")
-
-        src_xyzxyz = box_cxcyczwhd_to_xyzxyz(src_boxes)
-        tgt_xyzxyz = box_cxcyczwhd_to_xyzxyz(target_boxes)
-        loss_giou_refine_per_box = 1 - torch.diag(generalized_box_iou3d(src_xyzxyz, tgt_xyzxyz))
-        if not torch.isfinite(loss_giou_refine_per_box).all():
-            raise FloatingPointError("Non-finite GIoU refine loss values found.")
-        if (loss_giou_refine_per_box.abs() > 100).any():
-            raise FloatingPointError(
-                "Unusually large GIoU refine loss found: "
-                f"max_abs={loss_giou_refine_per_box.detach().abs().max().item():.6g}. "
-                "Check refined box scale and format."
-            )
-
-        loss_bbox_refine_raw = loss_bbox_refine_per_dim.sum() / num_boxes
-        loss_giou_refine_raw = loss_giou_refine_per_box.sum() / num_boxes
-        if not torch.isfinite(loss_bbox_refine_raw):
-            raise FloatingPointError("Non-finite reduced L1 refine bbox loss found.")
-        if not torch.isfinite(loss_giou_refine_raw):
-            raise FloatingPointError("Non-finite reduced GIoU refine loss found.")
-
-        losses = {
-            "loss_bbox_refine": loss_bbox_refine_raw,
-            "loss_giou_refine": loss_giou_refine_raw,
-            "loss_bbox_refine_raw": loss_bbox_refine_raw.detach(),
-            "loss_giou_refine_raw": loss_giou_refine_raw.detach(),
-            "box_refine_active": torch.ones((), device=src_boxes.device),
-        }
-        losses.update(debug_stats)
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
     def loss_contrastive_align(self, outputs, targets, indices, num_boxes):
@@ -881,220 +639,16 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
-    def _difficulty_loss_mode_id(self, enabled):
-        if not enabled:
-            return 0
-        if self.difficulty_loss_mode == "platform":
-            return 1
-        if self.difficulty_loss_mode == "mid_iou":
-            return 2
-        return 0
-
-    def _is_difficulty_loss_enabled(self, epoch=None):
-        current_epoch = -1 if epoch is None else int(epoch)
-        return (
-            self.use_difficulty_loss_weight
-            and self.training
-            and current_epoch >= self.difficulty_loss_warmup_epoch
-        )
-
-    def _difficulty_loss_stats(
-        self,
-        device,
-        active=False,
-        mode_id=0,
-        mean_weight=1.0,
-        max_weight=1.0,
-        num_weighted_samples=0,
-        weighted_platform=-1,
-        platform_gap=None,
-        mid_iou_ratio=0.0,
-        iou_mean=0.0,
-        iou_low=None,
-        iou_high=None,
-    ):
-        if platform_gap is None:
-            platform_gap = torch.zeros((), device=device)
-        elif not torch.is_tensor(platform_gap):
-            platform_gap = torch.tensor(float(platform_gap), device=device)
-        if iou_low is None:
-            iou_low = self.difficulty_iou_low
-        if iou_high is None:
-            iou_high = self.difficulty_iou_high
-        return {
-            "difficulty_loss_active": torch.tensor(float(active), device=device),
-            "difficulty_loss_mode_id": torch.tensor(float(mode_id), device=device),
-            "difficulty_loss_mean_weight": torch.tensor(float(mean_weight), device=device),
-            "difficulty_loss_max_weight": torch.tensor(float(max_weight), device=device),
-            "difficulty_loss_num_weighted_samples": torch.tensor(float(num_weighted_samples), device=device),
-            "difficulty_loss_weighted_platform": torch.tensor(float(weighted_platform), device=device),
-            "difficulty_loss_platform_gap": platform_gap.detach().to(device),
-            "difficulty_loss_mid_iou_ratio": torch.tensor(float(mid_iou_ratio), device=device),
-            "difficulty_loss_iou_mean": torch.tensor(float(iou_mean), device=device),
-            "difficulty_loss_iou_low": torch.tensor(float(iou_low), device=device),
-            "difficulty_loss_iou_high": torch.tensor(float(iou_high), device=device),
-        }
-
-    @torch.no_grad()
-    def _update_difficulty_platform_status(self, status_values, platform_labels):
-        device = status_values.device
-        status_values = status_values.detach()
-        platform_labels = platform_labels.to(device=device, dtype=torch.long)
-        for platform in platform_labels.unique():
-            platform_idx = int(platform.item())
-            if platform_idx < 0 or platform_idx >= self.num_platforms:
-                continue
-            mask = platform_labels == platform_idx
-            num_samples = int(mask.sum().item())
-            if num_samples < self.proto_min_platform_samples:
-                continue
-            batch_score = status_values[mask].mean()
-            if self.difficulty_platform_score_initialized[platform_idx]:
-                old_score = self.difficulty_platform_score_ema[platform_idx]
-                self.difficulty_platform_score_ema[platform_idx] = (
-                    self.proto_score_momentum * old_score
-                    + (1.0 - self.proto_score_momentum) * batch_score
-                )
-            else:
-                self.difficulty_platform_score_ema[platform_idx] = batch_score
-                self.difficulty_platform_score_initialized[platform_idx] = True
-            self.difficulty_platform_seen_count[platform_idx] += float(num_samples)
-
-    def _select_difficulty_weak_platform(self):
-        ready_mask = (
-            self.difficulty_platform_score_initialized
-            & (self.difficulty_platform_seen_count >= float(self.proto_min_platform_seen))
-        )
-        if int(ready_mask.sum().item()) < 2:
-            return -1, self.difficulty_platform_score_ema.sum() * 0.0, False
-
-        ready_indices = torch.nonzero(ready_mask, as_tuple=False).squeeze(1)
-        ready_scores = self.difficulty_platform_score_ema[ready_indices]
-        weak_pos = torch.argmax(ready_scores)
-        strong_pos = torch.argmin(ready_scores)
-        weak_score = ready_scores[weak_pos]
-        strong_score = ready_scores[strong_pos]
-        platform_gap = (weak_score - strong_score) / (0.5 * (weak_score + strong_score) + 1e-6)
-        weak_platform = int(ready_indices[weak_pos].item())
-        return weak_platform, platform_gap, True
-
-    def get_difficulty_loss_sample_weights(self, platform_labels, epoch=None, device=None):
-        if platform_labels is None:
-            if device is None:
-                device = self.difficulty_platform_score_ema.device
-            return None, self._difficulty_loss_stats(device)
-
-        device = platform_labels.device
-        enabled = self._is_difficulty_loss_enabled(epoch)
-        if not enabled or self.difficulty_loss_mode != "platform":
-            return None, self._difficulty_loss_stats(device)
-
-        weak_platform, platform_gap, status_ready = self._select_difficulty_weak_platform()
-        stats = self._difficulty_loss_stats(
-            device,
-            mode_id=self._difficulty_loss_mode_id(enabled),
-            weighted_platform=weak_platform,
-            platform_gap=platform_gap,
-        )
-        if not status_ready or weak_platform < 0:
-            return None, stats
-
-        max_weight = max(float(self.difficulty_loss_max_weight), 1.0)
-        weak_weight = min(1.0 + max(float(self.difficulty_loss_weight), 0.0), max_weight)
-        if weak_weight <= 1.0:
-            return None, stats
-
-        sample_weights = torch.ones(platform_labels.shape, dtype=torch.float32, device=device)
-        weak_mask = platform_labels.to(device=device, dtype=torch.long) == weak_platform
-        if not weak_mask.any():
-            return None, stats
-
-        sample_weights[weak_mask] = weak_weight
-        return sample_weights, self._difficulty_loss_stats(
-            device,
-            active=True,
-            mode_id=self._difficulty_loss_mode_id(enabled),
-            mean_weight=float(sample_weights.mean().item()),
-            max_weight=float(sample_weights.max().item()),
-            num_weighted_samples=int(weak_mask.sum().item()),
-            weighted_platform=weak_platform,
-            platform_gap=platform_gap,
-        )
-
-    @torch.no_grad()
-    def get_mid_iou_difficulty_loss_match_weights(self, src_boxes, target_boxes, epoch=None):
-        device = src_boxes.device
-        enabled = self._is_difficulty_loss_enabled(epoch)
-        if not enabled or self.difficulty_loss_mode != "mid_iou":
-            return None, self._difficulty_loss_stats(device)
-
-        mode_id = self._difficulty_loss_mode_id(enabled)
-        if src_boxes.numel() == 0:
-            return None, self._difficulty_loss_stats(device, mode_id=mode_id)
-
-        matched_iou = _aligned_iou3d(
-            box_cxcyczwhd_to_xyzxyz(src_boxes.detach()),
-            box_cxcyczwhd_to_xyzxyz(target_boxes.detach()),
-        )
-        low = float(self.difficulty_iou_low)
-        high = float(self.difficulty_iou_high)
-        mid_mask = (matched_iou >= low) & (matched_iou < high)
-
-        max_weight = max(float(self.difficulty_loss_max_weight), 1.0)
-        mid_weight = min(1.0 + max(float(self.difficulty_mid_iou_weight), 0.0), max_weight)
-        sample_weights = torch.ones_like(matched_iou, dtype=src_boxes.dtype, device=device)
-        if mid_weight > 1.0 and mid_mask.any():
-            sample_weights[mid_mask] = mid_weight
-
-        has_extra_weight = bool(mid_mask.any().item()) and mid_weight > 1.0
-        stats = self._difficulty_loss_stats(
-            device,
-            active=has_extra_weight,
-            mode_id=mode_id,
-            mean_weight=float(sample_weights.mean().item()),
-            max_weight=float(sample_weights.max().item()),
-            num_weighted_samples=int(mid_mask.sum().item()) if has_extra_weight else 0,
-            mid_iou_ratio=float(mid_mask.float().mean().item()),
-            iou_mean=float(matched_iou.mean().item()),
-            iou_low=low,
-            iou_high=high,
-        )
-        if not has_extra_weight:
-            return None, stats
-        return sample_weights, stats
-
-    @torch.no_grad()
-    def update_difficulty_loss_status(self, status_values, platform_labels):
-        if (
-            not self.use_difficulty_loss_weight
-            or self.difficulty_loss_mode != "platform"
-            or not self.training
-            or status_values is None
-            or platform_labels is None
-            or status_values.numel() == 0
-        ):
-            return
-        self._update_difficulty_platform_status(status_values, platform_labels)
-
-    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+    def get_loss(self, loss, outputs, targets, indices, num_boxes):
         loss_map = {
             'labels': self.loss_labels_st,
             'boxes': self.loss_boxes,
             'contrastive_align': self.loss_contrastive_align
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
-        if loss == 'boxes':
-            return self.loss_boxes(
-                outputs,
-                targets,
-                indices,
-                num_boxes,
-                difficulty_sample_weights=kwargs.get("difficulty_sample_weights"),
-                difficulty_epoch=kwargs.get("difficulty_epoch"),
-            )
         return loss_map[loss](outputs, targets, indices, num_boxes)
 
-    def forward(self, outputs, targets, difficulty_sample_weights=None, difficulty_epoch=None):
+    def forward(self, outputs, targets):
         """
         Perform the loss computation.
 
@@ -1123,11 +677,7 @@ class SetCriterion(nn.Module):
                 targets,
                 indices,
                 num_boxes,
-                difficulty_sample_weights=difficulty_sample_weights,
-                difficulty_epoch=difficulty_epoch,
             ))
-        if self.use_box_refine_head:
-            losses.update(self.loss_refined_boxes(outputs, targets, indices, num_boxes))
 
         return losses, indices
 
@@ -1219,12 +769,7 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
     zero = gt_center.sum() * 0.0
     original_gt_bbox = torch.cat([gt_center, gt_size], dim=-1)  # cxcyczwhd
     gt_bbox = original_gt_bbox
-    gt_bbox_enclosing_aligned = None
-    need_enclosing_aligned_gt = (
-        set_criterion.use_enclosing_aligned_gt_loss
-        or set_criterion.use_enclosing_aligned_gt_as_box_target
-    )
-    if need_enclosing_aligned_gt:
+    if set_criterion.use_enclosing_aligned_gt_as_box_target:
         if 'gt_bboxes' not in end_points:
             raise ValueError(
                 "enclosing aligned GT target requires end_points['gt_bboxes'] with 7D rotated GT boxes"
@@ -1234,9 +779,7 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
             raise ValueError(
                 f"end_points['gt_bboxes'] must have at least 7 dims, got {tuple(gt_bboxes_rotated.shape)}"
             )
-        gt_bbox_enclosing_aligned = rotated_gt_to_enclosing_aligned_box_torch(gt_bboxes_rotated)
-        if set_criterion.use_enclosing_aligned_gt_as_box_target:
-            gt_bbox = gt_bbox_enclosing_aligned
+        gt_bbox = rotated_gt_to_enclosing_aligned_box_torch(gt_bboxes_rotated)
     positive_map = end_points['positive_map']
     box_label_mask = end_points['box_label_mask']
     valid_gt_mask = box_label_mask.bool()
@@ -1274,35 +817,9 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
             "boxes": gt_bbox[b, valid_mask],
             "positive_map": positive_map[b, valid_mask],
         }
-        if gt_bbox_enclosing_aligned is not None:
-            target_item["boxes_enclosing_aligned"] = gt_bbox_enclosing_aligned[b, valid_mask]
         target.append(target_item)
 
     loss_ce, loss_bbox, loss_giou, loss_contrastive_align = 0, 0, 0, 0
-    loss_bbox_refine = zero
-    loss_giou_refine = zero
-    box_refine_active = zero
-    difficulty_loss_bbox_contrib = zero
-    difficulty_loss_giou_contrib = zero
-    box_refine_debug_stats = {}
-    difficulty_sample_weights = None
-    difficulty_loss_stats = None
-    difficulty_loss_mid_stats = []
-    difficulty_epoch = end_points.get("epoch", None)
-    if set_criterion.use_difficulty_loss_weight and set_criterion.training:
-        if set_criterion.difficulty_loss_mode == "platform":
-            difficulty_sample_weights, difficulty_loss_stats = set_criterion.get_difficulty_loss_sample_weights(
-                end_points.get("platform_label", None),
-                epoch=difficulty_epoch,
-                device=gt_center.device,
-            )
-        else:
-            difficulty_loss_stats = set_criterion._difficulty_loss_stats(
-                gt_center.device,
-                mode_id=set_criterion._difficulty_loss_mode_id(
-                    set_criterion._is_difficulty_loss_enabled(difficulty_epoch)
-                ),
-            )
     last_layer_indices = None
     last_layer_pred_boxes = None
     for prefix in prefixes:
@@ -1319,56 +836,19 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         pred_logits = end_points[f'{prefix}sem_cls_scores']  # (B, Q, n_class)
         output['pred_logits'] = pred_logits
         output["pred_boxes"] = pred_bbox
-        if set_criterion.use_box_refine_head and f'{prefix}refined_boxes' in end_points:
-            output["refined_boxes"] = end_points[f'{prefix}refined_boxes']
 
         # Compute all the requested losses
-        losses, indices = set_criterion(
-            output,
-            target,
-            difficulty_sample_weights=difficulty_sample_weights,
-            difficulty_epoch=difficulty_epoch,
-        )
+        losses, indices = set_criterion(output, target)
         if prefix == "last_":
             last_layer_indices = indices
             last_layer_pred_boxes = pred_bbox
-        if (
-            set_criterion.use_difficulty_loss_weight
-            and set_criterion.training
-            and set_criterion.difficulty_loss_mode == "mid_iou"
-        ):
-            mid_stats = {
-                key: value.detach()
-                for key, value in losses.items()
-                if key in DIFFICULTY_LOSS_STAT_KEYS
-            }
-            if mid_stats:
-                difficulty_loss_mid_stats.append(mid_stats)
         for loss_key in losses.keys():
-            if loss_key in DIFFICULTY_LOSS_STAT_KEYS:
-                continue
             end_points[f'{prefix}_{loss_key}'] = losses[loss_key]
         loss_ce += losses.get('loss_ce', 0)
         loss_bbox += losses['loss_bbox']
         loss_giou += losses.get('loss_giou', 0)
-        current_loss_bbox_refine = losses.get('loss_bbox_refine', zero)
-        current_loss_giou_refine = losses.get('loss_giou_refine', zero)
-        loss_bbox_refine += current_loss_bbox_refine
-        loss_giou_refine += current_loss_giou_refine
-        box_refine_active = torch.maximum(
-            box_refine_active,
-            losses.get('box_refine_active', zero).to(device=box_refine_active.device),
-        )
-        difficulty_loss_bbox_contrib += losses.get('difficulty_loss_bbox_contrib', zero)
-        difficulty_loss_giou_contrib += losses.get('difficulty_loss_giou_contrib', zero)
-        for stat_key in BOX_REFINE_LOSS_STAT_KEYS:
-            if stat_key in losses:
-                box_refine_debug_stats[stat_key] = losses[stat_key].detach()
         if 'proj_tokens' in end_points:
             loss_contrastive_align += losses['loss_contrastive_align']
-
-    if difficulty_loss_mid_stats:
-        difficulty_loss_stats = _aggregate_difficulty_loss_stats(difficulty_loss_mid_stats)
 
     if 'seeds_obj_cls_logits' in end_points.keys():
         query_points_generation_loss = compute_points_obj_cls_loss_hard_topk(
@@ -1387,38 +867,51 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
             + loss_contrastive_align
         )
     )
-    if set_criterion.use_box_refine_head:
-        refine_loss_weight = float(set_criterion.box_refine_loss_weight)
-        if set_criterion._use_enclosing_refine_target():
-            refine_loss_weight *= float(set_criterion.enclosing_gt_loss_weight)
-        loss = loss + refine_loss_weight * (loss_bbox_refine + loss_giou_refine)
     end_points['loss_ce'] = loss_ce
     end_points['loss_bbox'] = loss_bbox
     end_points['loss_giou'] = loss_giou
-    if set_criterion.use_box_refine_head:
-        end_points['loss_bbox_refine'] = loss_bbox_refine
-        end_points['loss_giou_refine'] = loss_giou_refine
-        end_points['box_refine_active'] = box_refine_active.detach()
-        for stat_key, stat_value in box_refine_debug_stats.items():
-            end_points[stat_key] = stat_value
     end_points['query_points_generation_loss'] = query_points_generation_loss
     end_points['loss_constrastive_align'] = loss_contrastive_align
+    if set_criterion.use_prop_proto and set_criterion.training:
+        language_scores = None
+        if "last_proj_queries" in end_points and "proj_tokens" in end_points:
+            token_scores = torch.matmul(
+                end_points["last_proj_queries"],
+                end_points["proj_tokens"].transpose(-1, -2),
+            )
+            language_scores_per_sample = []
+            for batch_idx, target_item in enumerate(target):
+                positive_tokens = target_item["positive_map"].sum(dim=0)
+                positive_tokens = positive_tokens[: token_scores.shape[-1]]
+                positive_tokens = positive_tokens / positive_tokens.sum().clamp_min(1e-6)
+                language_scores_per_sample.append(
+                    torch.matmul(token_scores[batch_idx], positive_tokens)
+                )
+            language_scores = torch.stack(language_scores_per_sample)
+        loss_prop_proto, prop_proto_stats = set_criterion.proposal_proto_loss(
+            end_points["proto_query_features"],
+            last_layer_pred_boxes,
+            target,
+            language_scores=language_scores,
+            epoch=end_points.get("epoch", None),
+        )
+        loss = loss + loss_prop_proto
+        end_points["loss_prop_proto"] = loss_prop_proto
+        end_points.update(prop_proto_stats)
+    else:
+        end_points["loss_prop_proto"] = zero
+        end_points["loss_prop_proto_raw"] = zero
+        end_points["prop_proto_active"] = zero
+        end_points["prop_proto_pos_count"] = zero
+        end_points["prop_proto_neg_count"] = zero
+        end_points["prop_proto_fallback_pos_count"] = zero
     matched_query_cache = None
-    need_difficulty_platform_status = (
-        set_criterion.use_difficulty_loss_weight
-        and set_criterion.difficulty_loss_mode == "platform"
-    )
     need_matched_query_cache = (
         set_criterion.training
         and "platform_label" in end_points
         and "proto_query_features" in end_points
-        and (
-            need_difficulty_platform_status
-            or (
-                set_criterion.use_platform_proto
-                and set_criterion.proto_feature_mode == "matched_query"
-            )
-        )
+        and set_criterion.use_platform_proto
+        and set_criterion.proto_feature_mode == "matched_query"
     )
     if need_matched_query_cache:
         matched_query_cache = extract_matched_query_features_and_box_difficulty(
@@ -1428,24 +921,9 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
             target,
             end_points["platform_label"].long(),
         )
-    if difficulty_loss_stats is not None:
-        end_points.update(difficulty_loss_stats)
-        end_points["difficulty_loss_bbox_contrib"] = difficulty_loss_bbox_contrib.detach()
-        end_points["difficulty_loss_giou_contrib"] = difficulty_loss_giou_contrib.detach()
-    if (
-        need_difficulty_platform_status
-        and set_criterion.training
-        and matched_query_cache is not None
-    ):
-        _, difficulty_platform_labels, _, matched_box_difficulty, _ = matched_query_cache
-        set_criterion.update_difficulty_loss_status(
-            matched_box_difficulty,
-            difficulty_platform_labels,
-        )
     if set_criterion.use_platform_proto and set_criterion.training:
         platform_labels = end_points["platform_label"].long()
         status_values = None
-        matched_ious = None
         if set_criterion.proto_feature_mode == "mean_query":
             if set_criterion.proto_status_mode == "box_difficulty":
                 raise ValueError(
@@ -1466,7 +944,7 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
                     target,
                     platform_labels,
                 )
-            proto_features, platform_labels, class_labels, matched_box_difficulty, matched_ious = matched_query_cache
+            proto_features, platform_labels, class_labels, matched_box_difficulty, _ = matched_query_cache
             if set_criterion.proto_status_mode == "box_difficulty":
                 status_values = matched_box_difficulty
             elif set_criterion.proto_status_mode == "proto_confidence":
@@ -1481,7 +959,6 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
             class_labels,
             status_values=status_values,
             epoch=end_points.get("epoch", None),
-            matched_ious=matched_ious if set_criterion.proto_feature_mode == "matched_query" else None,
         )
         loss = loss + loss_proto
         end_points["loss_proto"] = loss_proto
@@ -1506,10 +983,5 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         end_points["fallback_proto_count"] = zero
         end_points["weak_platform"] = zero
         end_points["strong_platform"] = zero
-        end_points["proto_pce_difficulty_aware_active"] = zero
-        end_points["proto_pce_hard_sample_ratio"] = zero
-        end_points["proto_pce_gate_mean"] = zero
-        end_points["proto_pce_gate_nonzero_count"] = zero
-        end_points["proto_pce_matched_iou_mean"] = zero
     end_points['loss'] = loss
     return loss, end_points
